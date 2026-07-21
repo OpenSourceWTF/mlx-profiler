@@ -3,6 +3,7 @@ target_sources(
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/broadcasting.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/compiled.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/common.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/dispatch_census.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/load.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/metal_kernel.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/reduce.cpp

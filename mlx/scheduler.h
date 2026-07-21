@@ -10,6 +10,7 @@
 #include <unordered_map>
 
 #include "mlx/api.h"
+#include "mlx/backend/common/dispatch_census.h"
 #include "mlx/backend/gpu/eval.h"
 #include "mlx/device.h"
 #include "mlx/stream.h"
@@ -39,7 +40,11 @@ struct StreamThread {
       std::function<void()> task;
       {
         std::unique_lock<std::mutex> lk(mtx);
+        uint64_t wait_t0 = census::enabled() ? census::now_ns() : 0;
         cond.wait(lk, [this] { return !this->q.empty() || this->stop; });
+        if (census::enabled()) {
+          census::note_wait("sched_worker_wait", census::now_ns() - wait_t0);
+        }
         if (q.empty() && stop) {
           return;
         }
@@ -101,9 +106,13 @@ class MLX_API Scheduler {
     std::unique_lock<std::mutex> lk(mtx);
     int n_tasks_old = n_active_tasks();
     if (n_tasks_old > 1) {
+      uint64_t wait_t0 = census::enabled() ? census::now_ns() : 0;
       completion_cv.wait(lk, [this, n_tasks_old] {
         return this->n_active_tasks() < n_tasks_old;
       });
+      if (census::enabled()) {
+        census::note_wait("sched_backpressure", census::now_ns() - wait_t0);
+      }
     }
   }
 

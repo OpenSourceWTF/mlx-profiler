@@ -9,6 +9,7 @@
 #define CA_PRIVATE_IMPLEMENTATION
 #define MTL_PRIVATE_IMPLEMENTATION
 
+#include "mlx/backend/common/dispatch_census.h"
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/event.h"
@@ -337,6 +338,9 @@ void CommandEncoder::set_buffer(
   // buffers
   all_inputs_.insert((void*)buf);
   all_outputs_.insert((void*)buf);
+  if (census::enabled()) {
+    census::note_buffer_bind();
+  }
   get_command_encoder()->setBuffer(buf, offset, idx);
 }
 
@@ -352,6 +356,11 @@ void CommandEncoder::set_input_array(
   needs_barrier_ =
       needs_barrier_ | (prev_outputs_.find(r_buf) != prev_outputs_.end());
   auto a_buf = static_cast<const MTL::Buffer*>(a.buffer().ptr());
+  // set_output_array routes through here, so this single hook counts input and
+  // output array binds.
+  if (census::enabled()) {
+    census::note_buffer_bind();
+  }
   get_command_encoder()->setBuffer(a_buf, a.offset() + offset, idx);
 }
 
@@ -409,6 +418,12 @@ void CommandEncoder::dispatch_threadgroups(
   maybeInsertBarrier();
   buffer_ops_++;
   get_command_encoder()->dispatchThreadgroups(grid_dims, group_dims);
+  if (census::enabled()) {
+    census::note_dispatch(
+        "threadgroups",
+        census::Dim3{grid_dims.width, grid_dims.height, grid_dims.depth},
+        census::Dim3{group_dims.width, group_dims.height, group_dims.depth});
+  }
 }
 
 void CommandEncoder::dispatch_threads(
@@ -417,6 +432,12 @@ void CommandEncoder::dispatch_threads(
   maybeInsertBarrier();
   buffer_ops_++;
   get_command_encoder()->dispatchThreads(grid_dims, group_dims);
+  if (census::enabled()) {
+    census::note_dispatch(
+        "threads",
+        census::Dim3{grid_dims.width, grid_dims.height, grid_dims.depth},
+        census::Dim3{group_dims.width, group_dims.height, group_dims.depth});
+  }
 }
 
 void CommandEncoder::barrier() {
@@ -516,6 +537,17 @@ bool CommandEncoder::needs_commit() const {
 }
 
 void CommandEncoder::commit(std::function<void()> completion) {
+  if (census::enabled()) {
+    // Finalize the host encode window for the buffer about to be committed and
+    // attach GPU execution times from its completion handler. GPUStartTime /
+    // GPUEndTime are seconds in the CACurrentMediaTime (mach-absolute) domain,
+    // matching census::now_ns(), so encode-vs-execute overlap is comparable.
+    const uint64_t cb_index = census::note_cb_encode_end();
+    buffer_->addCompletedHandler([cb_index](MTL::CommandBuffer* cbuf) {
+      census::note_cb_gpu_times(
+          cb_index, cbuf->GPUStartTime() * 1e9, cbuf->GPUEndTime() * 1e9);
+    });
+  }
   buffer_->addCompletedHandler(
       [&error_ = error_,
        wait_events = std::move(wait_events_),
@@ -563,7 +595,13 @@ void CommandEncoder::synchronize() {
   auto cbuf = buffer_; // retained
   end_encoding();
   commit();
+  const uint64_t wait_t0 = census::enabled() ? census::now_ns() : 0;
   cbuf->waitUntilCompleted();
+  if (census::enabled()) {
+    census::note_wait(
+        "cb_wait_until_completed", census::now_ns() - wait_t0);
+    census::flush();
+  }
 
   if (error_ && !exiting_) {
     auto error = std::move(error_);
@@ -867,6 +905,11 @@ MTL::ComputePipelineState* Device::get_kernel_(
 
   // Add kernel to cache
   kernel_map_.insert({hash_name, kernel});
+
+  // Record pipeline -> name so the census can label each dispatch.
+  if (census::enabled()) {
+    census::register_kernel(kernel.get(), hash_name.c_str());
+  }
 
   return kernel.get();
 }

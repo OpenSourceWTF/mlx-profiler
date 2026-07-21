@@ -11,6 +11,7 @@
 #include <unordered_set>
 
 #include "mlx/array.h"
+#include "mlx/backend/common/dispatch_census.h"
 #include "mlx/backend/common/metal_kernel.h"
 #include "mlx/backend/metal/resident.h"
 #include "mlx/device.h"
@@ -59,11 +60,17 @@ class MLX_API CommandEncoder {
   void maybeInsertBarrier();
 
   void set_compute_pipeline_state(MTL::ComputePipelineState* kernel) {
+    if (census::enabled()) {
+      census::note_pipeline(kernel);
+    }
     get_command_encoder()->setComputePipelineState(kernel);
   }
 
   template <typename Vec, typename = std::enable_if_t<is_vector_v<Vec>>>
   void set_vector_bytes(const Vec& vec, size_t nelems, int idx) {
+    if (census::enabled()) {
+      census::note_set_bytes(nelems * sizeof(typename Vec::value_type));
+    }
     get_command_encoder()->setBytes(
         vec.data(), nelems * sizeof(typename Vec::value_type), idx);
   }
@@ -74,11 +81,17 @@ class MLX_API CommandEncoder {
 
   template <typename T>
   void set_bytes(const T* v, int n, int idx) {
+    if (census::enabled()) {
+      census::note_set_bytes(n * sizeof(T));
+    }
     return get_command_encoder()->setBytes(v, n * sizeof(T), idx);
   }
 
   template <typename T>
   void set_bytes(const T& v, int idx) {
+    if (census::enabled()) {
+      census::note_set_bytes(sizeof(T));
+    }
     return get_command_encoder()->setBytes(&v, sizeof(T), idx);
   }
 

@@ -1,5 +1,6 @@
 // Copyright © 2023-2024 Apple Inc.
 #include "mlx/backend/metal/allocator.h"
+#include "mlx/backend/common/dispatch_census.h"
 #include "mlx/backend/gpu/device_info.h"
 #include "mlx/backend/metal/metal.h"
 #include "mlx/backend/metal/resident.h"
@@ -125,16 +126,34 @@ Buffer MetalAllocator::malloc(size_t size) {
     size = vm_page_size * ((size + vm_page_size - 1) / vm_page_size);
   }
 
+  // Census: count every buffer acquisition and time the mutex acquisition so a
+  // stall behind the completion-handler free() path shows up as "alloc_lock".
+  const bool census_on = census::enabled();
+  if (census_on) {
+    census::note_wait("alloc_calls", 0);
+  }
+  uint64_t lock_t0 = census_on ? census::now_ns() : 0;
+
   // Try the cache
   std::unique_lock lk(mutex_);
+  if (census_on) {
+    census::note_wait("alloc_lock", census::now_ns() - lock_t0);
+  }
   MTL::Buffer* buf = buffer_cache_.reuse_from_cache(size);
+  if (census_on && buf) {
+    census::note_wait("alloc_cache_hit", 0);
+  }
   if (!buf) {
     size_t mem_required = get_active_memory() + get_cache_memory() + size;
 
     // If we have a lot of memory pressure try to reclaim memory from the cache
     if (mem_required >= gc_limit_ || num_resources_ >= resource_limit_) {
+      uint64_t gc_t0 = census_on ? census::now_ns() : 0;
       num_resources_ -=
           buffer_cache_.release_cached_buffers(mem_required - gc_limit_);
+      if (census_on) {
+        census::note_wait("alloc_gc", census::now_ns() - gc_t0);
+      }
     }
 
     // Allocate new buffer if needed
@@ -145,11 +164,15 @@ Buffer MetalAllocator::malloc(size_t size) {
       throw std::runtime_error(msg.str());
     }
     lk.unlock();
+    uint64_t nb_t0 = census_on ? census::now_ns() : 0;
     if (size < small_size_ && heap_) {
       buf = heap_->newBuffer(size, resource_options);
     }
     if (!buf) {
       buf = device_->newBuffer(size, resource_options);
+    }
+    if (census_on && buf) {
+      census::note_wait("alloc_new_buffer", census::now_ns() - nb_t0);
     }
     if (!buf) {
       std::ostringstream msg;
