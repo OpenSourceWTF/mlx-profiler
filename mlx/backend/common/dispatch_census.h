@@ -49,6 +49,10 @@ inline bool enabled() {
   return detail::g_enabled;
 }
 
+// Parse the diagnostics-only async-eval task cap. Invalid and absent values
+// preserve MLX's upstream default of 10.
+int parse_max_active_tasks(const char* value);
+
 // Host clock in the mach-absolute nanosecond domain. This is the same domain as
 // MTLCommandBuffer GPUStartTime()/GPUEndTime() (CACurrentMediaTime-based), so
 // host encode times recorded with now_ns() are directly comparable to the GPU

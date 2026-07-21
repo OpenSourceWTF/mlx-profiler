@@ -1,5 +1,6 @@
 // Copyright © 2023-2024 Apple Inc.
 #include <algorithm>
+#include <cstdlib>
 #include <deque>
 #include <future>
 #include <numeric>
@@ -9,6 +10,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "mlx/backend/common/dispatch_census.h"
 #include "mlx/backend/cpu/eval.h"
 #include "mlx/backend/gpu/eval.h"
 #include "mlx/fence.h"
@@ -22,7 +24,18 @@
 
 namespace mlx::core {
 
-static constexpr int MAX_ACTIVE_TASKS = 10;
+// Outstanding-task cap for async eval. This bounds how many command buffers the
+// host may queue ahead of the GPU; the stock value is 10 and is NOT env-exposed
+// upstream. It is made tunable via MLX_MAX_ACTIVE_TASKS (parsed once, cached) so
+// the A3B encode-replay program can price whether this cap — rather than any
+// Metal / allocator / scheduler limit — is what serializes host encode behind
+// GPU execution. Default 10 preserves stock behavior; see the dispatch census
+// "cap_wait" bucket for how often the cap forces a wait and the total wait-ns.
+static int max_active_tasks() {
+  static const int value =
+      census::parse_max_active_tasks(std::getenv("MLX_MAX_ACTIVE_TASKS"));
+  return value;
+}
 
 namespace {
 
@@ -267,19 +280,28 @@ array eval_impl(std::vector<array> outputs, bool async) {
       cpu::eval(arr);
     }
 
-    if (scheduler::n_active_tasks() > MAX_ACTIVE_TASKS ||
-        (get_active_memory() > get_memory_limit() &&
-         scheduler::n_active_tasks() > 0)) {
+    const bool cap_hit = scheduler::n_active_tasks() > max_active_tasks();
+    const bool mem_hit = get_active_memory() > get_memory_limit() &&
+        scheduler::n_active_tasks() > 0;
+    if (cap_hit || mem_hit) {
       // Commit any open streams
       for (auto& s : open_streams) {
         if (s.device == Device::gpu) {
           gpu::finalize(s);
         }
       }
+      // Price the throttle wait that the active-task cap forces. The census
+      // "cap_wait" bucket's count is how many times per run the cap blocked and
+      // its total_ns is the aggregate stall — the direct test of whether the
+      // cap (not Metal/allocator/scheduler) explains the measured cv-wait.
+      uint64_t cap_t0 = census::enabled() ? census::now_ns() : 0;
       scheduler::wait_for_one();
       while (get_active_memory() > get_memory_limit() &&
              scheduler::n_active_tasks() > 0) {
         scheduler::wait_for_one();
+      }
+      if (census::enabled() && cap_hit) {
+        census::note_wait("cap_wait", census::now_ns() - cap_t0);
       }
     }
 

@@ -31,6 +31,17 @@ bool g_enabled = init_enabled();
 // still accumulate into the per-bucket totals but do not flood the JSONL.
 static constexpr uint64_t kWaitEmitFloorNs = 250;
 
+int parse_max_active_tasks(const char* value) {
+  if (value != nullptr && value[0] != '\0') {
+    char* end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end != value && *end == '\0' && parsed >= 1 && parsed <= 1000000) {
+      return static_cast<int>(parsed);
+    }
+  }
+  return 10;
+}
+
 uint64_t now_ns() {
   static mach_timebase_info_data_t tb = [] {
     mach_timebase_info_data_t t;
