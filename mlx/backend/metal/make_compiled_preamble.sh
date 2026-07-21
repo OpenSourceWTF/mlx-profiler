@@ -30,8 +30,18 @@ OUTPUT_FILE=${OUTPUT_DIR}/${SRC_NAME}.cpp
 # Prepare output
 mkdir -p "$OUTPUT_DIR"
 
-# Use the metal compiler to get a list of headers (with depth)
-CCC="xcrun -sdk macosx metal -x metal"
+# Use the metal compiler to get a list of headers (with depth). This step only
+# enumerates the local #include "..." graph so the shell expansion below can
+# order the headers; the compiler output itself is discarded. On a box with only
+# the Command Line Tools the Metal compiler is unavailable, so fall back to the
+# C++ compiler plus empty stubs for the <metal_*> system headers. Because the
+# expansion is pure shell text (grep/cat) over the identical local include graph,
+# the generated preamble is byte-identical to a Metal-compiler build.
+if xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+  CCC="xcrun -sdk macosx metal -x metal"
+else
+  CCC="${CC} -x c++ -I${SRC_DIR}/mlx/backend/metal/clt_stub_includes"
+fi
 HDRS=$( $CCC -I"$SRC_DIR" -I"$JIT_INCLUDES" -DMLX_METAL_JIT -E -P -CC -C -H "$INPUT_FILE" $CFLAGS -w 2>&1 1>/dev/null )
 
 # Fail early if the Metal compiler returned errors instead of header paths.

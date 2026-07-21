@@ -43,6 +43,15 @@ option(MLX_BUILD_SAFETENSORS "Include support for safetensors format" ON)
 option(MLX_BUILD_PYTHON_STUBS "Build stub files for python bindings" ON)
 option(MLX_METAL_JIT "Use JIT compilation for Metal kernels" OFF)
 option(MLX_USE_CCACHE "Use CCache for compilation cache when available" ON)
+# Reuse a prebuilt mlx.metallib instead of compiling Metal kernels, for boxes
+# with only the Command Line Tools (no Metal compiler). The metallib MUST match
+# the source version exactly (same kernels/ABI). See mlx/backend/metal/kernels
+# and make_compiled_preamble.sh for how the kernel compile + JIT-preamble
+# enumeration are made metal-compiler-free.
+set(MLX_METAL_PREBUILT_LIB
+    ""
+    CACHE FILEPATH
+          "Path to a prebuilt mlx.metallib to reuse instead of compiling Metal kernels")
 option(BUILD_SHARED_LIBS "Build mlx as a shared library" OFF)
 option(USE_SYSTEM_FMT "Use system's provided fmt library" OFF)
 option(USE_ASAN "Enable AddressSanitizer (ASan)" OFF)
@@ -213,12 +222,25 @@ if(MLX_BUILD_METAL)
 
     # Get Metal version.
     set(XCRUN_FLAGS "-mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}")
-    execute_process(
-      COMMAND
-        zsh "-c"
-        "echo \"__METAL_VERSION__\" | xcrun -sdk macosx metal ${XCRUN_FLAGS} -E -x metal -P - | tail -1"
-      OUTPUT_VARIABLE MLX_METAL_VERSION
-      OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+    if(MLX_METAL_PREBUILT_LIB)
+      # The supplied metallib must come from this exact source revision. Metal
+      # 4.0 is the current build default; callers may override the value when
+      # their exact-source metallib was built for another language version.
+      if(NOT MLX_METAL_VERSION)
+        set(MLX_METAL_VERSION 400)
+      endif()
+      message(
+        STATUS
+          "MLX_METAL_PREBUILT_LIB set: reusing ${MLX_METAL_PREBUILT_LIB}; "
+          "skipping the Metal compiler version probe (MLX_METAL_VERSION=${MLX_METAL_VERSION})")
+    else()
+      execute_process(
+        COMMAND
+          zsh "-c"
+          "echo \"__METAL_VERSION__\" | xcrun -sdk macosx metal ${XCRUN_FLAGS} -E -x metal -P - | tail -1"
+        OUTPUT_VARIABLE MLX_METAL_VERSION
+        OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+    endif()
     message(STATUS "Metal version: ${MLX_METAL_VERSION}")
   else()
     set(MLX_METAL_VERSION 0)
