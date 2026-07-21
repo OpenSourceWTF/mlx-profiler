@@ -10,6 +10,11 @@ set(BASE_HEADERS
     utils.h)
 
 function(build_kernel_base TARGET SRCFILE DEPS)
+  # CLT-only build: no Metal compiler, the metallib is supplied prebuilt, so the
+  # per-kernel .air compile is skipped entirely.
+  if(MLX_METAL_PREBUILT_LIB)
+    return()
+  endif()
   set(METAL_FLAGS
       -x
       metal
@@ -38,6 +43,10 @@ function(build_kernel_base TARGET SRCFILE DEPS)
 endfunction(build_kernel_base)
 
 function(build_kernel KERNEL)
+  # CLT-only build: leave KERNEL_AIR empty; the metallib is supplied prebuilt.
+  if(MLX_METAL_PREBUILT_LIB)
+    return()
+  endif()
   set(SRCFILE ${CMAKE_CURRENT_SOURCE_DIR}/${KERNEL}.metal)
   cmake_path(GET KERNEL STEM TARGET)
   build_kernel_base(${TARGET} ${SRCFILE} "${ARGN}")
@@ -177,17 +186,31 @@ if(NOT MLX_METAL_JIT)
 
 endif()
 
-add_custom_command(
-  OUTPUT ${MLX_METAL_PATH}/mlx.metallib
-  COMMAND xcrun -sdk macosx metal ${KERNEL_AIR} -o
-          ${MLX_METAL_PATH}/mlx.metallib
-  DEPENDS ${KERNEL_AIR}
-  COMMENT "Building mlx.metallib"
-  VERBATIM)
+if(MLX_METAL_PREBUILT_LIB)
+  # Reuse a prebuilt mlx.metallib (no Metal compiler on this box). Copy it into
+  # the location baked into METAL_PATH so both the compile-time fallback path in
+  # device.cpp and the install rule below resolve it. current_binary_dir()
+  # (dladdr on libmlx) colocates it next to libmlx.dylib after install.
+  if(NOT EXISTS "${MLX_METAL_PREBUILT_LIB}")
+    message(
+      FATAL_ERROR
+        "MLX_METAL_PREBUILT_LIB does not exist: ${MLX_METAL_PREBUILT_LIB}")
+  endif()
+  configure_file(${MLX_METAL_PREBUILT_LIB} ${MLX_METAL_PATH}/mlx.metallib
+                 COPYONLY)
+else()
+  add_custom_command(
+    OUTPUT ${MLX_METAL_PATH}/mlx.metallib
+    COMMAND xcrun -sdk macosx metal ${KERNEL_AIR} -o
+            ${MLX_METAL_PATH}/mlx.metallib
+    DEPENDS ${KERNEL_AIR}
+    COMMENT "Building mlx.metallib"
+    VERBATIM)
 
-add_custom_target(mlx-metallib DEPENDS ${MLX_METAL_PATH}/mlx.metallib)
+  add_custom_target(mlx-metallib DEPENDS ${MLX_METAL_PATH}/mlx.metallib)
 
-add_dependencies(mlx mlx-metallib)
+  add_dependencies(mlx mlx-metallib)
+endif()
 
 # Install metallib
 include(GNUInstallDirs)
