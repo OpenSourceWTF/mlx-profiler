@@ -402,4 +402,95 @@ void init_metal(nb::module_& m) {
         *example_inputs (array): Example array inputs; their buffers are pinned
           and rewritten on replay.
       )pbdoc");
+
+  // --- S4a chained submit ---------------------------------------------------
+  // A validated cross-handle blit: copy a SOURCE handle's output leaf into a
+  // DESTINATION handle's input leaf, fenced between the two handles' ICBs inside
+  // one chained command buffer (the cross-handle generalization of the
+  // same-handle CaptureReplayFeedbackPlan). Build it with make_chain_plan.
+  nb::class_<mx::metal::ChainPlan>(
+      metal,
+      "CaptureReplayChainPlan",
+      R"pbdoc(
+      EXPERIMENTAL (S4a). A validated cross-handle blit (source-handle output leaf
+      -> destination-handle input leaf) encoded between the two handles' ICBs in a
+      chained command buffer, so a decode stream's output feeds the next stream's
+      input ON-DEVICE (no host round-trip). Create it with :func:`make_chain_plan`.
+      )pbdoc")
+      .def_prop_ro(
+          "nbytes",
+          [](const mx::metal::ChainPlan& self) { return self.nbytes; },
+          "Validated equal byte size of the source and destination leaves.")
+      .def_prop_ro(
+          "src_out_index",
+          [](const mx::metal::ChainPlan& self) { return self.src_out_index; },
+          "Output-leaf index of the source handle (blit source).")
+      .def_prop_ro(
+          "dst_in_index",
+          [](const mx::metal::ChainPlan& self) { return self.dst_in_index; },
+          "Input-leaf index of the destination handle (blit destination).");
+
+  metal.def(
+      "make_chain_plan",
+      [](std::shared_ptr<mx::metal::CaptureReplay> src,
+         size_t src_out_index,
+         std::shared_ptr<mx::metal::CaptureReplay> dst,
+         size_t dst_in_index) {
+        nb::gil_scoped_release nogil;
+        return mx::metal::make_chain_plan(src, src_out_index, dst, dst_in_index);
+      },
+      "src"_a,
+      "src_out_index"_a,
+      "dst"_a,
+      "dst_in_index"_a,
+      R"pbdoc(
+      Validate and build a :class:`CaptureReplayChainPlan` copying output leaf
+      ``src_out_index`` of ``src`` into input leaf ``dst_in_index`` of ``dst``.
+      Both indices must be in range and the two leaves byte-size-equal (raises
+      otherwise). Pass the returned plans to :func:`chain_submit` as ``handoffs``.
+      )pbdoc");
+
+  metal.def(
+      "chain_submit",
+      [](std::vector<std::pair<
+             std::shared_ptr<mx::metal::CaptureReplay>,
+             std::shared_ptr<mx::metal::CaptureReplay::FeedbackPlan>>> stages,
+         std::vector<std::shared_ptr<mx::metal::ChainPlan>> handoffs) {
+        nb::gil_scoped_release nogil;
+        std::vector<mx::metal::ChainStage> chain_stages;
+        chain_stages.reserve(stages.size());
+        for (auto& s : stages) {
+          chain_stages.push_back(mx::metal::ChainStage{s.first, s.second});
+        }
+        return mx::metal::chain_submit(chain_stages, handoffs);
+      },
+      "stages"_a,
+      "handoffs"_a = std::vector<std::shared_ptr<mx::metal::ChainPlan>>{},
+      R"pbdoc(
+      Encode several captured handles' ICBs into ONE command buffer and commit it
+      with a SINGLE host submit (collapsing the per-stream submit/wait round-trips
+      of a serving cycle). ``stages`` is an ordered list of
+      ``(handle, feedback_plan_or_None)`` tuples — each handle's ICB, then its
+      same-handle feedback blits — and ``handoffs`` is a list of
+      :class:`CaptureReplayChainPlan` cross-handle blits inserted between the
+      stages (each handoff's source stage must precede its destination stage).
+      Every encoder is serialized by a fresh MTLFence per boundary, so producers
+      are ordered before consumers. Host input rewrites stay host-side per handle
+      BEFORE the call. Returns an integer ticket for :func:`chain_wait`. Serial-use
+      only: one chained command buffer in flight.
+      )pbdoc");
+
+  metal.def(
+      "chain_wait",
+      [](uint64_t ticket) {
+        nb::gil_scoped_release nogil;
+        mx::metal::chain_wait(ticket);
+      },
+      "ticket"_a,
+      R"pbdoc(
+      Block until the chained command buffer for ``ticket`` completes (the single
+      per-cycle wait). After it returns, read the small decision outputs from the
+      stage handles' :meth:`CaptureReplay.read_output`; the advancing decode state
+      was fed on-device by the feedback / handoff blits.
+      )pbdoc");
 }

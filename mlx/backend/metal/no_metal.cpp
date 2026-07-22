@@ -126,6 +126,23 @@ const std::vector<array>& CaptureReplay::outputs() const {
   return empty;
 }
 
+// --- S4a chained submit: throwing stubs (no Metal backend) -----------------
+std::shared_ptr<ChainPlan> make_chain_plan(
+    const std::shared_ptr<CaptureReplay>&,
+    size_t,
+    const std::shared_ptr<CaptureReplay>&,
+    size_t) {
+  throw std::runtime_error("[make_chain_plan] No Metal back-end.");
+}
+uint64_t chain_submit(
+    const std::vector<ChainStage>&,
+    const std::vector<std::shared_ptr<ChainPlan>>&) {
+  throw std::runtime_error("[chain_submit] No Metal back-end.");
+}
+void chain_wait(uint64_t) {
+  throw std::runtime_error("[chain_wait] No Metal back-end.");
+}
+
 } // namespace metal
 
 namespace fast {

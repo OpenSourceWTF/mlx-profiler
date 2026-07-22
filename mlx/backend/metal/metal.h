@@ -50,10 +50,28 @@ MLX_API const
  * recorded; call CaptureReplay::capture() afterwards to build the handle. */
 MLX_API void capture_begin();
 
+// --- S4a chained submit (forward declarations) -----------------------------
+// A cross-handle blit plan and one stage of a chained submit; full definitions
+// live after CaptureReplay (they reference it). chain_submit is a friend so it
+// can reach each stage handle's Impl (queue / ICB / residency) while encoding
+// them all into ONE command buffer.
+struct ChainPlan;
+struct ChainStage;
+MLX_API uint64_t chain_submit(
+    const std::vector<ChainStage>& stages,
+    const std::vector<std::shared_ptr<ChainPlan>>& handoffs);
+
 /** A replayable handle over a captured compute dispatch stream (alpha). */
 class MLX_API CaptureReplay {
  public:
   struct Impl;
+
+  // S4a: chain_submit encodes several handles' ICBs into one command buffer, so
+  // it needs each handle's Impl (residency arena, ICB, num_commands). Additive —
+  // the per-handle submit/replay APIs are unchanged.
+  friend uint64_t chain_submit(
+      const std::vector<ChainStage>& stages,
+      const std::vector<std::shared_ptr<ChainPlan>>& handoffs);
 
   ~CaptureReplay();
   CaptureReplay(const CaptureReplay&) = delete;
@@ -219,5 +237,92 @@ class MLX_API CaptureReplay {
   explicit CaptureReplay(std::unique_ptr<Impl> impl);
   std::unique_ptr<Impl> impl_;
 };
+
+// --- S4a chained submit: one command buffer for the whole decode cycle -------
+//
+// EXPERIMENTAL (S4a). The serving cycle runs four captured streams — draft, m2
+// verify, committed append, target sample — each today a SEPARATE
+// replay_submit + replay_wait, so each pays its own host submit/wait round-trip
+// (the §24 "remainder" the complete-capture milestone exposed). chain_submit
+// collapses them: it encodes every stage handle's executeCommandsInBuffer (plus
+// its OWN same-handle feedback blits) into ONE MTLCommandBuffer, with the
+// cross-stream data handoffs blitted device-side BETWEEN the stages, and commits
+// it with a SINGLE host submit; chain_wait is the SINGLE waitUntilCompleted. Host
+// input rewrites (write_input_leaf / write_input_range) stay host-side per handle
+// BEFORE the chain submit, exactly as today — chain_submit only encodes GPU work.
+//
+// Cross-handle handoff (ChainPlan): today the controller reads a stream's output
+// to the host and writes it into the next stream's input (draft's verify_input →
+// m2's ids leaf; m2's logits → target's input; committed hidden/token → append).
+// A ChainPlan makes that a device-side fenced blit copying a SOURCE handle's
+// output leaf into a DESTINATION handle's input leaf — the cross-handle
+// generalization of FeedbackPlan (which is same-handle output→input only). Build
+// it with make_chain_plan(); its src stage MUST be encoded before its dst stage.
+//
+// Fence / ordering: MLX buffers are MTLResourceHazardTrackingModeUntracked, so
+// the encoder boundary does NOT order anything. chain_submit serializes every
+// encoder (compute and blit) with a FRESH MTLFence per boundary — encoder k+1
+// waits on encoder k's fence and updates its own. That total order trivially
+// satisfies every data dependency because producers are always encoded before
+// consumers: a stage's ICB, then its feedback + outgoing cross-handle blits, then
+// the next stage's ICB (which waits on those blits). One chained command buffer
+// in flight at a time (serial-use, the chained-decode cadence; the same
+// discipline the per-handle feedback path documents).
+//
+// Residency: each stage's compute encoder explicitly useResources() its own
+// handle's pinned arena / heaps / dupes / packed_args (the fork's per-call
+// residency path), so the chain needs no per-queue residency set spanning
+// handles (the amortized per-handle MTLResidencySet is bound to that handle's own
+// queue, not the chain queue). Cross-handle blits name their src/dst directly, so
+// they are auto-resident. Address stability is asserted for EVERY handle (feedback
+// + handoff src/dst) BEFORE anything is encoded — a moved arena fails cleanly.
+
+/** A validated cross-handle blit: copy output leaf `src_out_index` of `src` into
+ * input leaf `dst_in_index` of `dst`, fenced between the two handles' ICBs inside
+ * a chained command buffer. Build with make_chain_plan (which validates ranges +
+ * equal byte size). Holds raw handle pointers (identity only, resolved to the
+ * pinned buffers at chain_submit time re-asserting address stability); the caller
+ * MUST keep both handles alive while any plan referencing them is submitted. */
+struct ChainPlan {
+  const CaptureReplay* src = nullptr; // source handle (blit source, P_out)
+  size_t src_out_index = 0; // output leaf of src
+  const CaptureReplay* dst = nullptr; // destination handle (blit dest, P_in)
+  size_t dst_in_index = 0; // input leaf of dst
+  size_t nbytes = 0; // validated equal byte size of both leaves
+};
+
+/** Validate and build a cross-handle ChainPlan. `src_out_index` must be in range
+ * for `src`'s outputs, `dst_in_index` in range for `dst`'s inputs, and the two
+ * leaves byte-size-equal (throws otherwise). */
+MLX_API std::shared_ptr<ChainPlan> make_chain_plan(
+    const std::shared_ptr<CaptureReplay>& src,
+    size_t src_out_index,
+    const std::shared_ptr<CaptureReplay>& dst,
+    size_t dst_in_index);
+
+/** One stage of a chained submit: a captured handle + an OPTIONAL same-handle
+ * feedback plan (its OWN P_out→P_in blits, advancing that handle's decode state),
+ * blitted right after the handle's ICB inside the chained command buffer. */
+struct ChainStage {
+  std::shared_ptr<CaptureReplay> handle;
+  std::shared_ptr<CaptureReplay::FeedbackPlan> feedback_plan; // or null
+};
+
+/** Encode every stage's ICB (+ its feedback blits) and the cross-handle
+ * `handoffs` into ONE command buffer in dependency order (fenced per boundary,
+ * see above) and commit WITHOUT waiting; returns an opaque ticket. `stages` must
+ * be non-empty, each handle distinct (a handle's ICB runs once per chain), and
+ * every handoff's src/dst must be among the stages with the src stage BEFORE the
+ * dst stage. Throws (nothing encoded) on any invalid stage/handoff or a moved
+ * arena. Serial-use only: one chained command buffer in flight. */
+MLX_API uint64_t chain_submit(
+    const std::vector<ChainStage>& stages,
+    const std::vector<std::shared_ptr<ChainPlan>>& handoffs = {});
+
+/** Block until the chained command buffer for `ticket` completes (the SINGLE
+ * per-cycle waitUntilCompleted). Throws on an unknown/already-waited ticket or a
+ * command-buffer error. After it returns, read each stage handle's small decision
+ * outputs via read_output(); the advancing state was fed on-device by the blits. */
+MLX_API void chain_wait(uint64_t ticket);
 
 } // namespace mlx::core::metal

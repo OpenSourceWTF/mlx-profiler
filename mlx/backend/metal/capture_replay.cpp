@@ -1304,4 +1304,329 @@ std::vector<array> CaptureReplay::replay(const std::vector<array>& new_inputs) {
   return read_outputs();
 }
 
+// ===========================================================================
+// S4a chained submit — one command buffer for the whole decode cycle
+// ===========================================================================
+
+namespace {
+
+// Dedicated chain queue + inflight registry, keyed by ticket. Separate from every
+// per-handle queue/inflight: the chained command buffer, its fresh per-boundary
+// fences, and the stage handles it references are all owned HERE (not by any one
+// handle) and released only when chain_wait completes. One chained CB in flight at
+// a time (serial-use), guarded by g_chain_mtx.
+struct ChainInflight {
+  NS::SharedPtr<MTL::CommandBuffer> cb;
+  // One MTLFence per encoder boundary (§12: a FRESH fence per boundary, never a
+  // reused one), kept alive until the CB completes.
+  std::vector<NS::SharedPtr<MTL::Fence>> fences;
+  // Pin the stage handles so their pinned arenas / ICBs cannot be freed between
+  // chain_submit and chain_wait even if the caller drops its references.
+  std::vector<std::shared_ptr<CaptureReplay>> handles;
+};
+std::mutex g_chain_mtx;
+NS::SharedPtr<MTL::CommandQueue> g_chain_queue;
+std::unordered_map<uint64_t, ChainInflight> g_chain_inflight;
+uint64_t g_chain_next_ticket = 1;
+
+// Address-stability + bounds guard for one leaf a chain blit touches: the captured
+// buffer must not have moved (allocator reuse) and offset()+nbytes must fit its
+// backing buffer, exactly as encode_and_commit's feedback pre-validation. Throws
+// with nothing encoded on any violation.
+void chain_check_leaf(
+    const array& arr,
+    const MTL::Buffer* expected_buf,
+    size_t nbytes,
+    const char* what) {
+  auto* cur = static_cast<const MTL::Buffer*>(arr.buffer().ptr());
+  if (cur != expected_buf) {
+    throw std::runtime_error(
+        std::string("[chain_submit] ") + what +
+        " buffer moved — the arena is no longer address-stable (allocator reuse).");
+  }
+  const size_t end = static_cast<size_t>(arr.offset()) + nbytes;
+  if (arr.offset() < 0 || (cur && end > cur->length())) {
+    throw std::runtime_error(
+        std::string("[chain_submit] ") + what +
+        " blit out of bounds — leaf offset + nbytes exceeds its buffer length.");
+  }
+}
+
+// Encode one leaf→leaf blit honoring BOTH arrays' array.offset() (= buffer base +
+// offset), mirroring the feedback blit / write_input_leaf addressing.
+void chain_blit(
+    MTL::BlitCommandEncoder* blit,
+    const array& src_arr,
+    const array& dst_arr,
+    size_t nbytes) {
+  auto* src = static_cast<const MTL::Buffer*>(src_arr.buffer().ptr());
+  auto* dst = static_cast<const MTL::Buffer*>(dst_arr.buffer().ptr());
+  blit->copyFromBuffer(
+      src,
+      static_cast<NS::UInteger>(src_arr.offset()),
+      dst,
+      static_cast<NS::UInteger>(dst_arr.offset()),
+      static_cast<NS::UInteger>(nbytes));
+}
+
+// Declare THIS stage handle's pinned arena resident on its compute encoder. The
+// chain queue carries no residency set spanning handles, so we always take the
+// per-call path (correct on every macOS; the amortized per-handle MTLResidencySet
+// is bound to that handle's own queue, not the chain queue).
+void chain_use_arena(MTL::ComputeCommandEncoder* enc, CaptureReplay::Impl& impl) {
+  if (!impl.arena_resources.empty()) {
+    enc->useResources(
+        impl.arena_resources.data(),
+        impl.arena_resources.size(),
+        MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
+  }
+  for (auto* h : impl.heaps) {
+    enc->useHeap(h);
+  }
+  for (auto& dup : impl.rename_dupes) {
+    enc->useResource(
+        dup.get(), MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
+  }
+  enc->useResource(impl.packed_args.get(), MTL::ResourceUsageRead);
+}
+
+} // namespace
+
+std::shared_ptr<ChainPlan> make_chain_plan(
+    const std::shared_ptr<CaptureReplay>& src,
+    size_t src_out_index,
+    const std::shared_ptr<CaptureReplay>& dst,
+    size_t dst_in_index) {
+  if (!src || !dst) {
+    throw std::invalid_argument("[make_chain_plan] null source/destination handle.");
+  }
+  const auto& souts = src->outputs();
+  const auto& dins = dst->inputs();
+  if (src_out_index >= souts.size()) {
+    throw std::out_of_range(
+        "[make_chain_plan] source output index " + std::to_string(src_out_index) +
+        " out of range (" + std::to_string(souts.size()) + " outputs).");
+  }
+  if (dst_in_index >= dins.size()) {
+    throw std::out_of_range(
+        "[make_chain_plan] destination input index " + std::to_string(dst_in_index) +
+        " out of range (" + std::to_string(dins.size()) + " inputs).");
+  }
+  size_t out_bytes = souts[src_out_index].nbytes();
+  size_t in_bytes = dins[dst_in_index].nbytes();
+  if (out_bytes != in_bytes) {
+    throw std::invalid_argument(
+        "[make_chain_plan] byte-size mismatch (src out " +
+        std::to_string(src_out_index) + " = " + std::to_string(out_bytes) +
+        " B, dst in " + std::to_string(dst_in_index) + " = " +
+        std::to_string(in_bytes) + " B). A cross-handle blit requires equal-size leaves.");
+  }
+  auto plan = std::make_shared<ChainPlan>();
+  plan->src = src.get();
+  plan->src_out_index = src_out_index;
+  plan->dst = dst.get();
+  plan->dst_in_index = dst_in_index;
+  plan->nbytes = out_bytes;
+  return plan;
+}
+
+uint64_t chain_submit(
+    const std::vector<ChainStage>& stages,
+    const std::vector<std::shared_ptr<ChainPlan>>& handoffs) {
+  if (stages.empty()) {
+    throw std::invalid_argument("[chain_submit] no stages given.");
+  }
+
+  // Map handle -> stage index; each handle appears at most once (a handle's ICB
+  // runs exactly once per chain).
+  std::unordered_map<const CaptureReplay*, size_t> stage_of;
+  for (size_t k = 0; k < stages.size(); ++k) {
+    auto* h = stages[k].handle.get();
+    if (h == nullptr) {
+      throw std::invalid_argument(
+          "[chain_submit] stage " + std::to_string(k) + " has a null handle.");
+    }
+    if (!stage_of.emplace(h, k).second) {
+      throw std::invalid_argument(
+          "[chain_submit] the same handle appears in more than one stage — a "
+          "handle's ICB may run only once per chain.");
+    }
+  }
+
+  // Validate handoffs and group them by SOURCE stage index (blitted right after
+  // that stage's compute, once its outputs exist). The src stage MUST precede the
+  // dst stage so the destination input is written before the destination ICB reads
+  // it (the serialization makes producers-before-consumers sufficient).
+  std::vector<std::vector<const ChainPlan*>> outgoing(stages.size());
+  for (size_t p = 0; p < handoffs.size(); ++p) {
+    const auto& plan = handoffs[p];
+    if (!plan) {
+      throw std::invalid_argument(
+          "[chain_submit] handoff " + std::to_string(p) + " is null.");
+    }
+    auto sit = stage_of.find(plan->src);
+    auto dit = stage_of.find(plan->dst);
+    if (sit == stage_of.end() || dit == stage_of.end()) {
+      throw std::invalid_argument(
+          "[chain_submit] handoff " + std::to_string(p) +
+          " references a handle that is not one of the stages.");
+    }
+    if (sit->second >= dit->second) {
+      throw std::invalid_argument(
+          "[chain_submit] handoff " + std::to_string(p) +
+          " source stage (" + std::to_string(sit->second) +
+          ") does not precede its destination stage (" +
+          std::to_string(dit->second) +
+          ") — a cross-handle blit must feed a LATER stage.");
+    }
+    outgoing[sit->second].push_back(plan.get());
+  }
+
+  auto pool = metal::new_scoped_memory_pool();
+  auto& d = metal::device(mlx::core::Device::gpu);
+  auto* mtl_device = d.mtl_device();
+
+  std::lock_guard<std::mutex> lk(g_chain_mtx);
+
+  // Address stability + bounds for EVERYTHING the chain will blit, BEFORE any
+  // encoding — a moved arena fails cleanly with nothing half-built.
+  for (const auto& stage : stages) {
+    auto& impl = *stage.handle->impl_;
+    if (stage.feedback_plan) {
+      for (const auto& b : stage.feedback_plan->blits) {
+        chain_check_leaf(
+            impl.outputs[b.out_index], impl.output_bufs[b.out_index], b.nbytes,
+            "feedback source");
+        chain_check_leaf(
+            impl.inputs[b.in_index], impl.input_bufs[b.in_index], b.nbytes,
+            "feedback destination");
+      }
+    }
+  }
+  for (const auto* plan : [&handoffs] {
+         std::vector<const ChainPlan*> all;
+         all.reserve(handoffs.size());
+         for (const auto& p : handoffs) {
+           all.push_back(p.get());
+         }
+         return all;
+       }()) {
+    auto& simpl = *plan->src->impl_;
+    auto& dimpl = *plan->dst->impl_;
+    chain_check_leaf(
+        simpl.outputs[plan->src_out_index], simpl.output_bufs[plan->src_out_index],
+        plan->nbytes, "handoff source");
+    chain_check_leaf(
+        dimpl.inputs[plan->dst_in_index], dimpl.input_bufs[plan->dst_in_index],
+        plan->nbytes, "handoff destination");
+  }
+
+  // The dedicated chain queue (created once, reused; serial-use).
+  if (!g_chain_queue) {
+    g_chain_queue = NS::TransferPtr(mtl_device->newCommandQueue());
+    if (!g_chain_queue) {
+      throw std::runtime_error("[chain_submit] failed to create the chain command queue.");
+    }
+  }
+
+  ChainInflight entry;
+  entry.handles.reserve(stages.size());
+  for (const auto& stage : stages) {
+    entry.handles.push_back(stage.handle);
+  }
+
+  auto* cb = g_chain_queue->commandBuffer();
+
+  // Linear fence chain: every encoder (compute or blit) waits on the previous
+  // encoder's fresh fence and updates its own. Total order => producers-before-
+  // consumers is sufficient for correctness with hazard-untracked buffers.
+  MTL::Fence* prev_fence = nullptr;
+  auto fresh_fence = [&]() -> MTL::Fence* {
+    auto f = NS::TransferPtr(mtl_device->newFence());
+    MTL::Fence* raw = f.get();
+    entry.fences.push_back(std::move(f));
+    return raw;
+  };
+
+  for (size_t k = 0; k < stages.size(); ++k) {
+    const auto& stage = stages[k];
+    auto& impl = *stage.handle->impl_;
+
+    // 1. Stage k compute: execute the handle's ICB.
+    auto* enc = cb->computeCommandEncoder(MTL::DispatchTypeConcurrent);
+    if (prev_fence) {
+      enc->waitForFence(prev_fence);
+    }
+    chain_use_arena(enc, impl);
+    enc->executeCommandsInBuffer(impl.icb.get(), NS::Range(0, impl.num_commands));
+    MTL::Fence* compute_fence = fresh_fence();
+    enc->updateFence(compute_fence);
+    enc->endEncoding();
+    prev_fence = compute_fence;
+
+    // 2. One blit encoder after stage k for its same-handle feedback + every
+    //    cross-handle handoff sourced from stage k. Both read stage k's just-
+    //    produced outputs; the handoff writes a LATER stage's input (which that
+    //    stage's ICB, ordered after this blit via the fence chain, then reads).
+    const bool has_feedback =
+        stage.feedback_plan && !stage.feedback_plan->blits.empty();
+    const bool has_handoffs = !outgoing[k].empty();
+    if (has_feedback || has_handoffs) {
+      auto* blit = cb->blitCommandEncoder();
+      blit->waitForFence(prev_fence);
+      if (has_feedback) {
+        for (const auto& b : stage.feedback_plan->blits) {
+          chain_blit(blit, impl.outputs[b.out_index], impl.inputs[b.in_index], b.nbytes);
+        }
+      }
+      for (const auto* plan : outgoing[k]) {
+        auto& simpl = *plan->src->impl_;
+        auto& dimpl = *plan->dst->impl_;
+        chain_blit(
+            blit,
+            simpl.outputs[plan->src_out_index],
+            dimpl.inputs[plan->dst_in_index],
+            plan->nbytes);
+      }
+      MTL::Fence* blit_fence = fresh_fence();
+      blit->updateFence(blit_fence);
+      blit->endEncoding();
+      prev_fence = blit_fence;
+    }
+  }
+
+  cb->commit();
+
+  uint64_t ticket = g_chain_next_ticket++;
+  entry.cb = NS::RetainPtr(cb);
+  g_chain_inflight.emplace(ticket, std::move(entry));
+  return ticket;
+}
+
+void chain_wait(uint64_t ticket) {
+  auto pool = metal::new_scoped_memory_pool();
+  // Move the whole entry out (cb + fences + handle pins) so everything the GPU is
+  // still using stays alive across waitUntilCompleted, then drops after it returns.
+  ChainInflight entry;
+  {
+    std::lock_guard<std::mutex> lk(g_chain_mtx);
+    auto it = g_chain_inflight.find(ticket);
+    if (it == g_chain_inflight.end()) {
+      throw std::invalid_argument(
+          "[chain_wait] Unknown or already-waited chain ticket " +
+          std::to_string(ticket) + ".");
+    }
+    entry = std::move(it->second);
+    g_chain_inflight.erase(it);
+  }
+  entry.cb->waitUntilCompleted();
+  if (entry.cb->status() == MTL::CommandBufferStatusError) {
+    std::string emsg = entry.cb->error()
+        ? std::string(entry.cb->error()->localizedDescription()->utf8String())
+        : std::string("unknown error");
+    throw std::runtime_error(
+        "[chain_wait] Chained command buffer failed: " + emsg);
+  }
+}
+
 } // namespace mlx::core::metal
