@@ -225,6 +225,61 @@ void init_metal(nb::module_& m) {
           has been waited.
           )pbdoc")
       .def(
+          "read_input",
+          [](mx::metal::CaptureReplay& self, size_t index) {
+            nb::gil_scoped_release nogil;
+            return self.read_input(index);
+          },
+          "index"_a,
+          R"pbdoc(
+          Copy ONE pinned INPUT leaf into a fresh host array, addressed through
+          the array's data pointer (respecting its offset), so it returns the
+          leaf's current logical contents — including bytes a feedback blit wrote
+          into it. Diagnostic counterpart of :meth:`read_output`: read back the
+          fed-back state inputs to isolate blit correctness from execution /
+          reference. Call after the producing replay has been waited.
+          )pbdoc")
+      .def(
+          "input_buffer_info",
+          [](mx::metal::CaptureReplay& self, size_t index) {
+            auto info = self.input_buffer_info(index);
+            nb::dict d;
+            d["buffer_id"] = info.buffer_id;
+            d["offset"] = info.offset;
+            d["nbytes"] = info.nbytes;
+            d["buffer_length"] = info.buffer_length;
+            d["heap"] = info.heap;
+            return d;
+          },
+          "index"_a,
+          R"pbdoc(
+          Debug view of an INPUT leaf's backing buffer as a dict: ``buffer_id``
+          (opaque MTL::Buffer identity), ``offset`` (the array's byte offset
+          within the buffer — nonzero for a view / suballocated leaf), ``nbytes``
+          (logical leaf size), ``buffer_length`` (allocation length), and
+          ``heap`` (suballocated from the shared < 256 B heap). Reveals which
+          state leaves sit at a nonzero offset — the case a naive offset-0 blit
+          would mis-copy.
+          )pbdoc")
+      .def(
+          "output_buffer_info",
+          [](mx::metal::CaptureReplay& self, size_t index) {
+            auto info = self.output_buffer_info(index);
+            nb::dict d;
+            d["buffer_id"] = info.buffer_id;
+            d["offset"] = info.offset;
+            d["nbytes"] = info.nbytes;
+            d["buffer_length"] = info.buffer_length;
+            d["heap"] = info.heap;
+            return d;
+          },
+          "index"_a,
+          R"pbdoc(
+          Debug view of an OUTPUT leaf's backing buffer (same dict shape as
+          :meth:`input_buffer_info`). Reveals which final_state outputs sit at a
+          nonzero offset — the blit source side of the same mis-copy case.
+          )pbdoc")
+      .def(
           "output_arrays",
           [](mx::metal::CaptureReplay& self, std::vector<size_t> indices) {
             nb::gil_scoped_release nogil;

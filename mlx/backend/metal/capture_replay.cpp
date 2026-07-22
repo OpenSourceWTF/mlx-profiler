@@ -939,15 +939,29 @@ uint64_t encode_and_commit(
   // arena fails cleanly with nothing half-encoded.
   if (has_feedback) {
     for (auto& b : plan->blits) {
-      auto* src =
-          static_cast<const MTL::Buffer*>(impl.outputs[b.out_index].buffer().ptr());
-      auto* dst =
-          static_cast<const MTL::Buffer*>(impl.inputs[b.in_index].buffer().ptr());
+      auto& out_arr = impl.outputs[b.out_index];
+      auto& in_arr = impl.inputs[b.in_index];
+      auto* src = static_cast<const MTL::Buffer*>(out_arr.buffer().ptr());
+      auto* dst = static_cast<const MTL::Buffer*>(in_arr.buffer().ptr());
       if (src != impl.output_bufs[b.out_index] ||
           dst != impl.input_bufs[b.in_index]) {
         throw std::runtime_error(
             "[CaptureReplay::replay_submit] Feedback plan buffer moved — the "
             "arena is no longer address-stable (allocator reuse).");
+      }
+      // A leaf's data begins at array.offset() within its (possibly shared /
+      // suballocated) MTL::Buffer — NOT at the buffer base. The blit MUST copy
+      // from/to that offset, exactly as write_input_leaf / read_output do via
+      // array.data(). Bounds-check here so a bad plan fails cleanly instead of
+      // GPU-faulting (or silently mis-copying) mid-encode.
+      const size_t src_end = static_cast<size_t>(out_arr.offset()) + b.nbytes;
+      const size_t dst_end = static_cast<size_t>(in_arr.offset()) + b.nbytes;
+      if (out_arr.offset() < 0 || in_arr.offset() < 0 ||
+          (src && src_end > src->length()) ||
+          (dst && dst_end > dst->length())) {
+        throw std::runtime_error(
+            "[CaptureReplay::replay_submit] Feedback blit out of bounds — a "
+            "leaf's offset + nbytes exceeds its backing buffer length.");
       }
     }
   }
@@ -990,11 +1004,22 @@ uint64_t encode_and_commit(
     auto* blit = cb->blitCommandEncoder();
     blit->waitForFence(impl.feedback_fence.get());
     for (auto& b : plan->blits) {
-      auto* src =
-          static_cast<const MTL::Buffer*>(impl.outputs[b.out_index].buffer().ptr());
-      auto* dst =
-          static_cast<const MTL::Buffer*>(impl.inputs[b.in_index].buffer().ptr());
-      blit->copyFromBuffer(src, 0, dst, 0, b.nbytes);
+      auto& out_arr = impl.outputs[b.out_index];
+      auto& in_arr = impl.inputs[b.in_index];
+      auto* src = static_cast<const MTL::Buffer*>(out_arr.buffer().ptr());
+      auto* dst = static_cast<const MTL::Buffer*>(in_arr.buffer().ptr());
+      // Copy P_out[out_leaf] -> P_in[in_leaf] at EACH leaf's real data offset
+      // (array.offset()), mirroring write_input_leaf / read_output which address
+      // the pinned buffers through array.data() (= buffer base + offset). A
+      // hardcoded 0 offset mis-copies any leaf whose data is a view /
+      // suballocation at a nonzero offset within its (shared) MTL::Buffer, which
+      // corrupts the fed-back state exactly one cycle downstream.
+      blit->copyFromBuffer(
+          src,
+          static_cast<NS::UInteger>(out_arr.offset()),
+          dst,
+          static_cast<NS::UInteger>(in_arr.offset()),
+          static_cast<NS::UInteger>(b.nbytes));
     }
     blit->endEncoding();
   }
@@ -1142,6 +1167,62 @@ array CaptureReplay::read_output(size_t index) {
   void* mem = std::malloc(std::max<size_t>(nbytes, 1));
   std::memcpy(mem, out.data<const char>(), nbytes);
   return array(mem, out.shape(), out.dtype(), [](void* p) { std::free(p); });
+}
+
+array CaptureReplay::read_input(size_t index) {
+  auto& impl = *impl_;
+  if (index >= impl.inputs.size()) {
+    throw std::out_of_range(
+        "[CaptureReplay::read_input] input index " + std::to_string(index) +
+        " out of range (" + std::to_string(impl.inputs.size()) + " inputs).");
+  }
+  // Host copy of ONE pinned input leaf, addressed through array.data() (= buffer
+  // base + offset) so it returns the leaf's CURRENT logical contents — including
+  // any bytes a feedback blit wrote into it. Diagnostic counterpart of
+  // read_output: read back the fed-back state inputs to isolate blit
+  // correctness (are the inputs advanced right?) from execution/reference.
+  auto& in = impl.inputs[index];
+  size_t nbytes = in.nbytes();
+  void* mem = std::malloc(std::max<size_t>(nbytes, 1));
+  std::memcpy(mem, in.data<const char>(), nbytes);
+  return array(mem, in.shape(), in.dtype(), [](void* p) { std::free(p); });
+}
+
+namespace {
+CaptureReplay::LeafBufferInfo leaf_buffer_info(const array& a) {
+  auto* buf = static_cast<const MTL::Buffer*>(a.buffer().ptr());
+  CaptureReplay::LeafBufferInfo info;
+  info.buffer_id = reinterpret_cast<uint64_t>(buf);
+  info.offset = a.offset();
+  info.nbytes = a.nbytes();
+  info.buffer_length = buf ? static_cast<uint64_t>(buf->length()) : 0;
+  info.heap = buf != nullptr && buf->heap() != nullptr;
+  return info;
+}
+} // namespace
+
+CaptureReplay::LeafBufferInfo CaptureReplay::input_buffer_info(
+    size_t index) const {
+  auto& impl = *impl_;
+  if (index >= impl.inputs.size()) {
+    throw std::out_of_range(
+        "[CaptureReplay::input_buffer_info] input index " +
+        std::to_string(index) + " out of range (" +
+        std::to_string(impl.inputs.size()) + " inputs).");
+  }
+  return leaf_buffer_info(impl.inputs[index]);
+}
+
+CaptureReplay::LeafBufferInfo CaptureReplay::output_buffer_info(
+    size_t index) const {
+  auto& impl = *impl_;
+  if (index >= impl.outputs.size()) {
+    throw std::out_of_range(
+        "[CaptureReplay::output_buffer_info] output index " +
+        std::to_string(index) + " out of range (" +
+        std::to_string(impl.outputs.size()) + " outputs).");
+  }
+  return leaf_buffer_info(impl.outputs[index]);
 }
 
 std::vector<array> CaptureReplay::output_arrays(

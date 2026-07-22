@@ -68,6 +68,17 @@ std::vector<array> CaptureReplay::read_outputs() {
 array CaptureReplay::read_output(size_t) {
   throw std::runtime_error("[CaptureReplay::read_output] No Metal back-end.");
 }
+array CaptureReplay::read_input(size_t) {
+  throw std::runtime_error("[CaptureReplay::read_input] No Metal back-end.");
+}
+CaptureReplay::LeafBufferInfo CaptureReplay::input_buffer_info(size_t) const {
+  throw std::runtime_error(
+      "[CaptureReplay::input_buffer_info] No Metal back-end.");
+}
+CaptureReplay::LeafBufferInfo CaptureReplay::output_buffer_info(size_t) const {
+  throw std::runtime_error(
+      "[CaptureReplay::output_buffer_info] No Metal back-end.");
+}
 std::vector<array> CaptureReplay::output_arrays(
     const std::vector<size_t>&) const {
   throw std::runtime_error("[CaptureReplay::output_arrays] No Metal back-end.");

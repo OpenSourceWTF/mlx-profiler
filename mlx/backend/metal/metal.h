@@ -140,6 +140,32 @@ class MLX_API CaptureReplay {
    * read_outputs). Call after the producing replay has been waited. */
   array read_output(size_t index);
 
+  /** Host copy of ONE input leaf, addressed through the array's data pointer
+   * (respecting its offset). Returns the leaf's CURRENT logical contents,
+   * including bytes a feedback blit wrote into it. Diagnostic use: read back the
+   * fed-back state inputs to isolate blit correctness (were the inputs advanced
+   * correctly?) from execution / reference. Call after the producing replay has
+   * been waited. */
+  array read_input(size_t index);
+
+  /** Debug view of a leaf's backing buffer. `buffer_id` is the MTL::Buffer* as
+   * an opaque integer (identity only — never dereferenced); `offset` is the
+   * array's byte offset within that buffer (nonzero for a view / suballocated
+   * leaf); `nbytes` is the leaf's logical byte size; `buffer_length` is the
+   * buffer's allocation length; `heap` is true when the buffer is suballocated
+   * from the shared MTL::Heap (< 256 B). Reveals which state leaves sit at a
+   * nonzero offset — the case a naive offset-0 blit would mis-copy. Backend-
+   * agnostic (no Metal types) so it binds from Python. */
+  struct LeafBufferInfo {
+    uint64_t buffer_id = 0;
+    int64_t offset = 0;
+    uint64_t nbytes = 0;
+    uint64_t buffer_length = 0;
+    bool heap = false;
+  };
+  LeafBufferInfo input_buffer_info(size_t index) const;
+  LeafBufferInfo output_buffer_info(size_t index) const;
+
   /** Zero-copy mx.array views of the pinned output buffers at `indices`.
    * ALIASING CONTRACT: the returned arrays alias the pinned output buffers in
    * place — they reflect the most recently completed replay and are only valid
