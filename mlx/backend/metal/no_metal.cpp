@@ -42,6 +42,18 @@ CaptureReplay::~CaptureReplay() = default;
 std::vector<array> CaptureReplay::replay(const std::vector<array>&) {
   throw std::runtime_error("[CaptureReplay::replay] No Metal back-end.");
 }
+uint64_t CaptureReplay::replay_submit(const std::vector<array>&) {
+  throw std::runtime_error("[CaptureReplay::replay_submit] No Metal back-end.");
+}
+void CaptureReplay::replay_wait(uint64_t) {
+  throw std::runtime_error("[CaptureReplay::replay_wait] No Metal back-end.");
+}
+std::vector<array> CaptureReplay::read_outputs() {
+  throw std::runtime_error("[CaptureReplay::read_outputs] No Metal back-end.");
+}
+bool CaptureReplay::residency_set_active() const {
+  return false;
+}
 size_t CaptureReplay::num_commands() const {
   return 0;
 }

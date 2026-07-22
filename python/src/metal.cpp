@@ -119,8 +119,43 @@ void init_metal(nb::module_& m) {
           R"pbdoc(
           Write ``inputs`` into the pinned input buffers (address-stability
           asserted) and submit one command buffer that executes the ICB.
-          Returns a fresh copy of each pinned output array.
+          Returns a fresh copy of each pinned output array (submit + wait + read).
           )pbdoc")
+      .def(
+          "replay_submit",
+          [](mx::metal::CaptureReplay& self, std::vector<mx::array> inputs) {
+            nb::gil_scoped_release nogil;
+            return self.replay_submit(inputs);
+          },
+          "inputs"_a,
+          R"pbdoc(
+          Write ``inputs`` into the pinned buffers and commit ONE command buffer
+          WITHOUT waiting. Returns an integer ticket for :func:`replay_wait`.
+          At pipeline depth > 1 successive submits share the pinned input
+          buffers; use same-value inputs or external double-buffering.
+          )pbdoc")
+      .def(
+          "replay_wait",
+          [](mx::metal::CaptureReplay& self, uint64_t ticket) {
+            nb::gil_scoped_release nogil;
+            self.replay_wait(ticket);
+          },
+          "ticket"_a,
+          "Block until the command buffer for ``ticket`` completes.")
+      .def(
+          "read_outputs",
+          [](mx::metal::CaptureReplay& self) {
+            nb::gil_scoped_release nogil;
+            return self.read_outputs();
+          },
+          R"pbdoc(
+          Copy the current pinned output buffers into fresh host arrays. Call
+          after the producing replay has been waited; excluded from timed paths.
+          )pbdoc")
+      .def_prop_ro(
+          "residency_set_active",
+          &mx::metal::CaptureReplay::residency_set_active,
+          "Whether the amortized persistent-residency path is active (mac15+).")
       .def_prop_ro(
           "num_commands",
           &mx::metal::CaptureReplay::num_commands,

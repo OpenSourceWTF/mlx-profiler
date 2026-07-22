@@ -57,6 +57,12 @@
 //     every command. This lets the bulk of each layer's independent kernels run
 //     concurrently; num_barriers()/largest_barrier_free_run() report the result.
 //     The toy's fully dependent chain still gets ~a barrier per command.
+//   * Async replay (S3 lever, perf): replay is split into replay_submit (encode
+//     + commit, no wait -> ticket) and replay_wait (block on a ticket), with
+//     read_outputs() moved out of the timed path and a persistent MTLResidencySet
+//     on the replay queue amortizing the per-call useResources/useHeap host cost.
+//     This isolates the host command-submit cost and enables pipelined replay;
+//     the synchronous replay() delegates to submit+wait+read (toy unchanged).
 //
 // Invariants STILL NOT handled (these WILL break a graph):
 //   * Allocator reuse across evals: pinning holds captured buffers, but any
@@ -84,6 +90,7 @@
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/metal.h"
 
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -327,6 +334,19 @@ struct CaptureReplay::Impl {
   // made resident on replay via useResources alongside the arena.
   std::vector<NS::SharedPtr<MTL::Buffer>> rename_dupes;
 
+  // Async replay (S3 lever). Persistent residency set attached to the replay
+  // queue amortizes the per-call useResources/useHeap host cost (macOS 15+ /
+  // Metal3); use_residency records whether it is active (else replay_submit
+  // falls back to per-call residency). inflight holds submitted-but-unwaited
+  // command buffers keyed by an opaque ticket. Cached arena Resource* array for
+  // the fallback path. Guarded by submit_mtx_ for pipelined use.
+  NS::SharedPtr<MTL::ResidencySet> residency;
+  bool use_residency = false;
+  std::vector<const MTL::Resource*> arena_resources;
+  std::unordered_map<uint64_t, NS::SharedPtr<MTL::CommandBuffer>> inflight;
+  uint64_t next_ticket = 1;
+  std::mutex submit_mtx;
+
   // Distinct pinned buffers (arena) — used for useResources and, at teardown,
   // for the deferred allocator free.
   std::vector<MTL::Buffer*> arena;
@@ -346,7 +366,16 @@ struct CaptureReplay::Impl {
   std::vector<const MTL::Buffer*> input_bufs;
 
   ~Impl() {
+    // Drain any submitted-but-unwaited command buffers before touching the
+    // buffers they read/write (they reference the pinned arena / dupes).
+    for (auto& kv : inflight) {
+      if (kv.second) {
+        kv.second->waitUntilCompleted();
+      }
+    }
+    inflight.clear();
     // Drop MTL objects first.
+    residency.reset();
     icb.reset();
     packed_args.reset();
     icb_pipelines.clear();
@@ -803,6 +832,44 @@ std::shared_ptr<CaptureReplay> CaptureReplay::capture(
     fail("[CaptureReplay::capture] Failed to create replay command queue.");
   }
 
+  // 4b. Async-replay amortization: a persistent MTLResidencySet on the replay
+  // queue makes the arena/heaps/dupes/packed_args resident ONCE, so
+  // replay_submit skips the per-call useResources/useHeap host cost (the S3
+  // lever). This declares residency over already-allocated buffers — it does not
+  // allocate, so it does not move the allocator's memory knob. macOS 15+/Metal3
+  // only; on older systems use_residency stays false and replay_submit does the
+  // per-call residency (identical to the synchronous path). Cache the arena as a
+  // Resource* array for that fallback either way.
+  impl->arena_resources.reserve(impl->arena.size());
+  for (auto* b : impl->arena) {
+    impl->arena_resources.push_back(static_cast<const MTL::Resource*>(b));
+  }
+  if (__builtin_available(macOS 15, iOS 18, *)) {
+    if (mtl_device->supportsFamily(MTL::GPUFamilyMetal3)) {
+      auto rdesc =
+          NS::TransferPtr(MTL::ResidencySetDescriptor::alloc()->init());
+      NS::Error* rerr = nullptr;
+      auto rset = NS::TransferPtr(mtl_device->newResidencySet(rdesc.get(), &rerr));
+      if (rset) {
+        for (auto* b : impl->arena) {
+          rset->addAllocation(b);
+        }
+        for (auto* h : impl->heaps) {
+          rset->addAllocation(h);
+        }
+        for (auto& dup : impl->rename_dupes) {
+          rset->addAllocation(dup.get());
+        }
+        rset->addAllocation(impl->packed_args.get());
+        rset->commit();
+        rset->requestResidency();
+        impl->queue->addResidencySet(rset.get());
+        impl->residency = rset;
+        impl->use_residency = true;
+      }
+    }
+  }
+
   // 5. Record the captured leaves / results (they hold the pinned buffers).
   impl->inputs = inputs;
   impl->outputs = outputs;
@@ -815,74 +882,100 @@ std::shared_ptr<CaptureReplay> CaptureReplay::capture(
   return std::shared_ptr<CaptureReplay>(new CaptureReplay(std::move(impl)));
 }
 
-std::vector<array> CaptureReplay::replay(const std::vector<array>& new_inputs) {
+uint64_t CaptureReplay::replay_submit(const std::vector<array>& new_inputs) {
   auto& impl = *impl_;
   if (new_inputs.size() != impl.inputs.size()) {
     throw std::invalid_argument(
-        "[CaptureReplay::replay] Expected " +
+        "[CaptureReplay::replay_submit] Expected " +
         std::to_string(impl.inputs.size()) + " inputs, got " +
         std::to_string(new_inputs.size()) + ".");
   }
-
+  std::lock_guard<std::mutex> lk(impl.submit_mtx);
   auto pool = metal::new_scoped_memory_pool();
 
   // (a) Address-stability assert + (b) write new values into pinned inputs.
+  // NOTE: at pipeline depth > 1 these writes can race a prior in-flight replay's
+  // GPU reads of the same pinned input buffers; the bench uses same-value inputs
+  // (byte-identical writes are race-free) for pipelined timing and proves
+  // fresh-value correctness unpipelined. Documented in the bench.
   for (size_t i = 0; i < new_inputs.size(); ++i) {
-    // vLLM-style assert: the pinned input buffer must not have moved.
     auto* cur = static_cast<const MTL::Buffer*>(impl.inputs[i].buffer().ptr());
     if (cur != impl.input_bufs[i]) {
       throw std::runtime_error(
-          "[CaptureReplay::replay] Captured input buffer moved — the arena is "
-          "no longer address-stable (allocator reuse). Alpha cannot recover.");
+          "[CaptureReplay::replay_submit] Captured input buffer moved — the "
+          "arena is no longer address-stable (allocator reuse).");
     }
     array ni = new_inputs[i];
     ni.eval();
     if (ni.nbytes() != impl.inputs[i].nbytes()) {
       throw std::invalid_argument(
-          "[CaptureReplay::replay] Input " + std::to_string(i) +
+          "[CaptureReplay::replay_submit] Input " + std::to_string(i) +
           " size mismatch vs capture.");
     }
     std::memcpy(
         impl.inputs[i].data<char>(), ni.data<const char>(), ni.nbytes());
   }
 
-  // (c) Submit ONE command buffer: make the arena resident, execute the ICB.
+  // (c) Encode ONE command buffer and commit WITHOUT waiting. When the
+  // persistent residency set is active the per-call residency declaration is
+  // skipped (the amortization); otherwise fall back to per-call residency.
   auto* cb = impl.queue->commandBuffer();
   auto* enc = cb->computeCommandEncoder(MTL::DispatchTypeConcurrent);
-  if (!impl.arena.empty()) {
-    enc->useResources(
-        reinterpret_cast<const MTL::Resource* const*>(impl.arena.data()),
-        impl.arena.size(),
-        MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
+  if (!impl.use_residency) {
+    if (!impl.arena_resources.empty()) {
+      enc->useResources(
+          impl.arena_resources.data(),
+          impl.arena_resources.size(),
+          MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
+    }
+    for (auto* h : impl.heaps) {
+      enc->useHeap(h);
+    }
+    for (auto& dup : impl.rename_dupes) {
+      enc->useResource(
+          dup.get(), MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
+    }
+    enc->useResource(impl.packed_args.get(), MTL::ResourceUsageRead);
   }
-  // Blocker 2: wire the heaps backing any <256 B sub-allocated arena buffers.
-  // useResource on a heap sub-buffer is not sufficient on the replay queue (no
-  // residency set here); useHeap makes every allocation on that heap resident.
-  for (auto* h : impl.heaps) {
-    enc->useHeap(h);
-  }
-  // Rename duplicates (fix a) are device buffers outside the arena; make them
-  // resident too. Empty unless MLX_CAPTURE_REPLAY_RENAME was set at capture.
-  for (auto& dup : impl.rename_dupes) {
-    enc->useResource(
-        dup.get(), MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
-  }
-  enc->useResource(
-      impl.packed_args.get(), MTL::ResourceUsageRead);
   enc->executeCommandsInBuffer(impl.icb.get(), NS::Range(0, impl.num_commands));
   enc->endEncoding();
   cb->commit();
+
+  uint64_t ticket = impl.next_ticket++;
+  impl.inflight.emplace(ticket, NS::RetainPtr(cb));
+  return ticket;
+}
+
+void CaptureReplay::replay_wait(uint64_t ticket) {
+  auto& impl = *impl_;
+  auto pool = metal::new_scoped_memory_pool();
+  NS::SharedPtr<MTL::CommandBuffer> cb;
+  {
+    std::lock_guard<std::mutex> lk(impl.submit_mtx);
+    auto it = impl.inflight.find(ticket);
+    if (it == impl.inflight.end()) {
+      throw std::invalid_argument(
+          "[CaptureReplay::replay_wait] Unknown or already-waited ticket " +
+          std::to_string(ticket) + ".");
+    }
+    cb = it->second;
+    impl.inflight.erase(it);
+  }
   cb->waitUntilCompleted();
   if (cb->status() == MTL::CommandBufferStatusError) {
     std::string emsg = cb->error()
         ? std::string(cb->error()->localizedDescription()->utf8String())
         : std::string("unknown error");
     throw std::runtime_error(
-        "[CaptureReplay::replay] Command buffer failed: " + emsg);
+        "[CaptureReplay::replay_wait] Command buffer failed: " + emsg);
   }
+}
 
-  // (d) Copy each pinned output into a fresh host-backed array so the caller
-  //     holds a stable snapshot (the pinned buffer is overwritten next replay).
+std::vector<array> CaptureReplay::read_outputs() {
+  auto& impl = *impl_;
+  // Copy each pinned output into a fresh host-backed array. Call after the
+  // producing replay has completed (replay_wait); the pinned buffer is
+  // overwritten by the next replay. Excluded from the async timed path.
   std::vector<array> results;
   results.reserve(impl.outputs.size());
   for (auto& out : impl.outputs) {
@@ -890,12 +983,21 @@ std::vector<array> CaptureReplay::replay(const std::vector<array>& new_inputs) {
     void* mem = std::malloc(std::max<size_t>(nbytes, 1));
     std::memcpy(mem, out.data<const char>(), nbytes);
     results.emplace_back(
-        mem,
-        out.shape(),
-        out.dtype(),
-        [](void* p) { std::free(p); });
+        mem, out.shape(), out.dtype(), [](void* p) { std::free(p); });
   }
   return results;
+}
+
+bool CaptureReplay::residency_set_active() const {
+  return impl_->use_residency;
+}
+
+std::vector<array> CaptureReplay::replay(const std::vector<array>& new_inputs) {
+  // Compat synchronous path: submit + wait + copy-out (unchanged behaviour for
+  // the toy and the existing bench phases).
+  uint64_t ticket = replay_submit(new_inputs);
+  replay_wait(ticket);
+  return read_outputs();
 }
 
 } // namespace mlx::core::metal

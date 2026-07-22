@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -67,8 +68,22 @@ class MLX_API CaptureReplay {
 
   /** Write `new_inputs` into the pinned input buffers (address-stability
    * asserted) and submit one command buffer that executes the ICB. Returns a
-   * fresh copy of each pinned output array. */
+   * fresh copy of each pinned output array. Compat = submit + wait + read. */
   std::vector<array> replay(const std::vector<array>& new_inputs);
+
+  /** Async split of replay (S3 host-submit isolation / pipelining).
+   * replay_submit writes inputs into the pinned buffers and commits ONE command
+   * buffer WITHOUT waiting, returning an opaque ticket. replay_wait blocks on a
+   * ticket's completion. read_outputs copies the current pinned outputs into
+   * fresh host arrays (call after the producing submit has been waited).
+   * At pipeline depth > 1 the caller must use same-value inputs OR external
+   * double-buffering — successive submits share the pinned input buffers. */
+  uint64_t replay_submit(const std::vector<array>& new_inputs);
+  void replay_wait(uint64_t ticket);
+  std::vector<array> read_outputs();
+
+  /** Whether the amortized persistent-residency path is active (macOS 15+). */
+  bool residency_set_active() const;
 
   /** Number of compute commands baked into the ICB. */
   size_t num_commands() const;
