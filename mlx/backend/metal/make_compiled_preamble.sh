@@ -60,10 +60,16 @@ if [ -n "$HDRS" ]; then
   fi
 fi
 
-# Remove any included system frameworks (for MetalPerformancePrimitive headers).
+# Remove headers used only to let a preprocessor enumerate the include graph.
+# Full-Xcode SDK headers are outside the source tree; the CLT fallback stubs are
+# inside it, so both must be filtered before the local headers are expanded.
 # Match "Xcode.app" rather than bare "Xcode" so project checkouts that live under
 # a directory named Xcode/ are not filtered out along with the SDK headers.
-HDRS=$(echo "$HDRS" | grep -v "Xcode.app")
+HDRS=$(
+  echo "$HDRS" |
+    grep -v "Xcode.app" |
+    grep -vF "${SRC_DIR}/mlx/backend/metal/clt_stub_includes/"
+)
 
 # Use the header depth to sort the files in order of inclusion
 declare -a HDRS_LIST=()

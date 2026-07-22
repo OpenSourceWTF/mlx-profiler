@@ -55,3 +55,12 @@ add_test(
   NAME dispatch_census_enabled
   COMMAND ${CMAKE_COMMAND} -E env MLX_DISPATCH_CENSUS=${CENSUS_ON}
           $<TARGET_FILE:dispatch_census_smoke> enabled ${CENSUS_ON})
+
+if(APPLE)
+  add_test(
+    NAME clt_preamble_excludes_stub_headers
+    COMMAND
+      bash ${CMAKE_CURRENT_SOURCE_DIR}/clt_preamble_smoke.sh
+      ${PROJECT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/clt-preamble-smoke
+      ${CMAKE_C_COMPILER})
+endif()
