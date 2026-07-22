@@ -818,9 +818,12 @@ MTL::ComputePipelineState* Device::get_kernel_(
 
   // S2b: when capture is armed, retain the MTL::Function this pipeline was
   // built from so a captured pipeline can be re-created with
-  // supportIndirectCommandBuffers=YES for use inside an ICB.
+  // supportIndirectCommandBuffers=YES for use inside an ICB. S2b-beta also
+  // retains any linked (private) functions so the ICB pipeline can be rebuilt
+  // with a matching MTL::LinkedFunctions set (blocker 3).
   if (capture::enabled()) {
-    capture::register_kernel_function(kernel.get(), mtl_function.get());
+    capture::register_kernel_function(
+        kernel.get(), mtl_function.get(), linked_functions);
   }
 
   return kernel.get();

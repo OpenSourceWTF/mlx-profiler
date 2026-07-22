@@ -23,7 +23,27 @@
 // is stable; replay() writes new input values into the pinned input buffers and
 // issues a single executeCommandsInBuffer.
 //
-// Alpha invariants NOT yet handled (these WILL break a graph):
+// S2b-beta fixes (to capture the REAL A3B m2_verify graph, not just the toy).
+// Each is additive and guarded so the alpha toy path is unchanged:
+//   * Blocker 1 (input-boundary copies): a copy on an input leaf
+//     (reshape/astype/broadcast) is captured natively — it is just another
+//     recorded compute dispatch, and its SOURCE is the pinned, rewritten input.
+//     capture() now also ASSERTS that every declared input leaf is actually
+//     read by the recorded stream (its buffer is in the arena), so a leaf the
+//     graph never touches on the GPU fails loudly instead of being silently
+//     ignored on replay.
+//   * Blocker 2 (heap-suballocated small buffers): MLX suballocates buffers
+//     < 256 B from a shared MTL::Heap, and the dedicated replay queue does NOT
+//     carry the allocator's residency set. capture() records the distinct heaps
+//     backing the arena and replay() useHeap()s them, so A3B's tiny buffers
+//     (input_ids, int32 offsets, scalars) are resident. The toy has no < 256 B
+//     buffers, so this list is empty there.
+//   * Blocker 3 (linked-function kernels): the pipeline registry now retains
+//     each kernel's linked (private) functions too, and capture() rebuilds the
+//     ICB pipeline with a matching MTL::LinkedFunctions set. Empty for plain
+//     kernels (the toy), so no behaviour change there.
+//
+// Invariants STILL NOT handled (these WILL break a graph):
 //   * Allocator reuse across evals: pinning holds captured buffers, but any
 //     graph whose per-cycle buffer set is not identical to the captured one
 //     (dynamic shapes, KV-cache growth that reallocates, control flow) is out
@@ -32,9 +52,8 @@
 //   * setBytes values are baked as CONSTANTS. Any per-cycle-varying value that
 //     MLX passes via setBytes (rather than a tensor buffer) would be frozen at
 //     capture. The R1/compiled A3B stack already makes cycle-varying values
-//     tensor-resident; the toy graph has none.
-//   * Kernels created with linked_functions (rare; not in the toy graph) are
-//     not registered for ICB pipeline re-creation → capture() throws.
+//     (token ids, offsets) tensor-resident; shapes/strides are cycle-invariant
+//     for the shape-stable compiled entry, so freezing them is correct.
 //   * Donation INTO the captured region: prevented for inputs by holding the
 //     input arrays live during the recorded eval (non-donatable); intermediates
 //     donate among themselves harmlessly (all pinned). Donation of an input's
@@ -77,9 +96,15 @@ std::atomic<bool> g_recording{false};
 namespace {
 
 // --- pipeline -> retained MTL::Function registry --------------------------
+// Retains the primary function and any linked (private) functions the pipeline
+// was built from, so capture() can rebuild an ICB-capable pipeline with an
+// identical MTL::LinkedFunctions set (blocker 3).
+struct FnEntry {
+  NS::SharedPtr<MTL::Function> fn;
+  std::vector<NS::SharedPtr<MTL::Function>> linked;
+};
 std::mutex g_fn_mtx;
-std::unordered_map<MTL::ComputePipelineState*, NS::SharedPtr<MTL::Function>>
-    g_functions;
+std::unordered_map<MTL::ComputePipelineState*, FnEntry> g_functions;
 
 // --- recorded dispatch stream ---------------------------------------------
 struct BufferBind {
@@ -123,18 +148,41 @@ Recorder g_rec;
 
 void register_kernel_function(
     MTL::ComputePipelineState* pipeline,
-    MTL::Function* fn) {
+    MTL::Function* fn,
+    const std::vector<MTL::Function*>& linked_functions) {
   if (!detail::g_enabled || pipeline == nullptr || fn == nullptr) {
     return;
   }
+  FnEntry entry;
+  entry.fn = NS::RetainPtr(fn);
+  entry.linked.reserve(linked_functions.size());
+  for (auto* lf : linked_functions) {
+    if (lf != nullptr) {
+      entry.linked.push_back(NS::RetainPtr(lf));
+    }
+  }
   std::lock_guard<std::mutex> lk(g_fn_mtx);
-  g_functions.emplace(pipeline, NS::RetainPtr(fn));
+  g_functions.emplace(pipeline, std::move(entry));
 }
 
 MTL::Function* function_for_pipeline(MTL::ComputePipelineState* pipeline) {
   std::lock_guard<std::mutex> lk(g_fn_mtx);
   auto it = g_functions.find(pipeline);
-  return it == g_functions.end() ? nullptr : it->second.get();
+  return it == g_functions.end() ? nullptr : it->second.fn.get();
+}
+
+std::vector<MTL::Function*> linked_functions_for_pipeline(
+    MTL::ComputePipelineState* pipeline) {
+  std::lock_guard<std::mutex> lk(g_fn_mtx);
+  auto it = g_functions.find(pipeline);
+  std::vector<MTL::Function*> out;
+  if (it != g_functions.end()) {
+    out.reserve(it->second.linked.size());
+    for (auto& lf : it->second.linked) {
+      out.push_back(lf.get());
+    }
+  }
+  return out;
 }
 
 void note_pipeline(MTL::ComputePipelineState* pipeline) {
@@ -229,6 +277,13 @@ struct CaptureReplay::Impl {
   // Distinct pinned buffers (arena) — used for useResources and, at teardown,
   // for the deferred allocator free.
   std::vector<MTL::Buffer*> arena;
+
+  // Distinct MTL heaps backing arena sub-allocations. MLX suballocates buffers
+  // smaller than 256 B from a shared heap; the replay queue does NOT carry the
+  // allocator's residency set (which wires the heap), so those small buffers
+  // are only made resident if we useHeap() them explicitly (blocker 2). The
+  // alpha toy has no <256 B buffers, so this list is empty there.
+  std::vector<MTL::Heap*> heaps;
 
   // Captured graph leaves / results. inputs are rewritten on replay; outputs
   // are copied out. input_bufs mirrors the input buffers for the
@@ -327,6 +382,45 @@ std::shared_ptr<CaptureReplay> CaptureReplay::capture(
   impl->arena = arena;
   impl->num_commands = dispatches.size();
 
+  // Blocker 2: gather the distinct heaps backing any sub-allocated arena buffer
+  // so replay can wire them explicitly (the replay queue has no residency set).
+  {
+    std::unordered_set<MTL::Heap*> heap_set;
+    for (auto* b : impl->arena) {
+      if (auto* h = b->heap()) {
+        heap_set.insert(h);
+      }
+    }
+    impl->heaps.assign(heap_set.begin(), heap_set.end());
+  }
+
+  // Blocker 1 (input-boundary copies): a copy inserted on an input leaf
+  // (reshape/astype/broadcast) is captured NATIVELY — it is just another
+  // compute dispatch in this backend, so it is recorded into the ICB, and its
+  // SOURCE (the leaf we pin and rewrite on replay) is bound and pinned by
+  // note_buffer_bind exactly like any other input. The address-stability assert
+  // in replay() then guards that same source buffer. The only case that stays
+  // unrecoverable is a leaf the compiled graph never reads on the GPU stream
+  // (materialized outside the recorded eval): replay would memcpy into a buffer
+  // no command reads. Detect that here and fail clearly — never hand back a
+  // handle that silently drops an input.
+  {
+    std::unordered_set<const MTL::Buffer*> arena_set(
+        impl->arena.begin(), impl->arena.end());
+    for (size_t i = 0; i < inputs.size(); ++i) {
+      auto* ib = static_cast<const MTL::Buffer*>(inputs[i].buffer().ptr());
+      if (ib == nullptr || arena_set.find(ib) == arena_set.end()) {
+        fail(
+            "[CaptureReplay::capture] Input leaf " + std::to_string(i) +
+            " is not read by any captured dispatch: its buffer is absent from "
+            "the recorded stream. The compiled graph consumed it only through a "
+            "value materialized outside the recorded eval, so replay could not "
+            "rewrite it (input-boundary copy via a non-dispatch path). Feed "
+            "this leaf through a GPU op, or exclude it from the input set.");
+      }
+    }
+  }
+
   // 1. Pack every setBytes payload into one shared buffer at 256-B-aligned
   //    slots and remember each slot's offset (indirect commands have no
   //    setBytes — these become kernel-buffer binds).
@@ -390,6 +484,19 @@ std::shared_ptr<CaptureReplay> CaptureReplay::capture(
         NS::TransferPtr(MTL::ComputePipelineDescriptor::alloc()->init());
     desc->setComputeFunction(fn);
     desc->setSupportIndirectCommandBuffers(true);
+    // Blocker 3: rebuild with the SAME linked (private) functions the kernel was
+    // originally built from, or newComputePipelineState fails to resolve the
+    // private symbols. Empty for plain kernels (alpha toy) → no behaviour change.
+    auto linked = capture::linked_functions_for_pipeline(disp.pipeline);
+    NS::SharedPtr<MTL::LinkedFunctions> lfuncs;
+    if (!linked.empty()) {
+      lfuncs = NS::TransferPtr(MTL::LinkedFunctions::linkedFunctions());
+      NS::Array* funcs_arr = NS::Array::array(
+          reinterpret_cast<const NS::Object* const*>(linked.data()),
+          linked.size());
+      lfuncs->setPrivateFunctions(funcs_arr);
+      desc->setLinkedFunctions(lfuncs.get());
+    }
     NS::Error* error = nullptr;
     auto icb_pipe = NS::TransferPtr(mtl_device->newComputePipelineState(
         desc.get(), MTL::PipelineOptionNone, nullptr, &error));
@@ -503,6 +610,12 @@ std::vector<array> CaptureReplay::replay(const std::vector<array>& new_inputs) {
         reinterpret_cast<const MTL::Resource* const*>(impl.arena.data()),
         impl.arena.size(),
         MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
+  }
+  // Blocker 2: wire the heaps backing any <256 B sub-allocated arena buffers.
+  // useResource on a heap sub-buffer is not sufficient on the replay queue (no
+  // residency set here); useHeap makes every allocation on that heap resident.
+  for (auto* h : impl.heaps) {
+    enc->useHeap(h);
   }
   enc->useResource(
       impl.packed_args.get(), MTL::ResourceUsageRead);

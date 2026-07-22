@@ -26,6 +26,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <atomic>
+#include <vector>
 
 namespace mlx::core::metal::capture {
 
@@ -62,12 +63,26 @@ void note_dispatch_threadgroups(MTL::Size grid, MTL::Size group);
 // --- Device pipeline -> function registry (populated only when enabled()) ---
 // Called once per kernel at pipeline-state creation. Retains fn so a captured
 // pipeline can be re-created with supportIndirectCommandBuffers=YES.
+//
+// S2b-beta (blocker 3): kernels built with linked (private) functions must be
+// rebuilt for the ICB with the SAME MTL::LinkedFunctions, or the rebuild fails
+// (unresolved symbols). We therefore also retain the linked functions here so
+// capture() can re-apply them. `linked_functions` is empty for the common case
+// (plain kernels, incl. the alpha toy) — in which the behaviour is identical to
+// the alpha.
 void register_kernel_function(
     MTL::ComputePipelineState* pipeline,
-    MTL::Function* fn);
+    MTL::Function* fn,
+    const std::vector<MTL::Function*>& linked_functions = {});
 
 // Look up the retained function for a captured pipeline; nullptr if unknown.
 MTL::Function* function_for_pipeline(MTL::ComputePipelineState* pipeline);
+
+// Retained linked (private) functions for a captured pipeline, in registration
+// order. Empty if the pipeline had none (the common case) or is unknown. Used
+// to rebuild the ICB pipeline with matching MTL::LinkedFunctions.
+std::vector<MTL::Function*> linked_functions_for_pipeline(
+    MTL::ComputePipelineState* pipeline);
 
 // --- Recording window control (called from the public capture API) ---------
 void begin_recording();
