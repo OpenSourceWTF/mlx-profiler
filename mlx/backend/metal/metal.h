@@ -133,6 +133,22 @@ class MLX_API CaptureReplay {
       const std::vector<array>& arrays,
       const std::shared_ptr<FeedbackPlan>& feedback_plan = nullptr);
 
+  /** Sub-leaf range write (S3 draft delta-rewrite). Memcpy the bytes of `src`
+   * into the pinned input leaf `index` at `byte_offset` WITHIN that leaf's data
+   * (addressed through the leaf's array.data() = buffer base + array.offset(), so
+   * a suballocated/viewed leaf's own nonzero offset is honored), leaving every
+   * other byte of the leaf — and every other leaf — untouched (they persist the
+   * previous submit / range write). `src` must be contiguous; its nbytes plus
+   * `byte_offset` must fit within the leaf's logical nbytes. Address stability is
+   * asserted (the captured buffer must not have moved). Does NOT commit — pair
+   * range writes with a following replay_submit_partial (which writes the small
+   * cycle-varying leaves and commits ONE command buffer). The draft reserved-
+   * window K/V leaves change only in the 1-2 rows appended per cycle; rewriting
+   * just those rows (per (batch,head) contiguous run) replaces the whole-window
+   * memcpy replay_submit(_partial) would pay. Serial-use only (the draft chain is
+   * submit->wait per cycle), same as replay_submit_partial. */
+  void write_input_range(size_t index, size_t byte_offset, const array& src);
+
   void replay_wait(uint64_t ticket);
   std::vector<array> read_outputs();
 

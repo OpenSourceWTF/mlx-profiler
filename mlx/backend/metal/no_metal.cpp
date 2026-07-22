@@ -59,6 +59,10 @@ uint64_t CaptureReplay::replay_submit_partial(
   throw std::runtime_error(
       "[CaptureReplay::replay_submit_partial] No Metal back-end.");
 }
+void CaptureReplay::write_input_range(size_t, size_t, const array&) {
+  throw std::runtime_error(
+      "[CaptureReplay::write_input_range] No Metal back-end.");
+}
 void CaptureReplay::replay_wait(uint64_t) {
   throw std::runtime_error("[CaptureReplay::replay_wait] No Metal back-end.");
 }

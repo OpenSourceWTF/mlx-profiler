@@ -1113,6 +1113,49 @@ uint64_t CaptureReplay::replay_submit_partial(
   return encode_and_commit(impl, feedback_plan.get());
 }
 
+void CaptureReplay::write_input_range(
+    size_t index, size_t byte_offset, const array& src) {
+  auto& impl = *impl_;
+  if (index >= impl.inputs.size()) {
+    throw std::out_of_range(
+        "[CaptureReplay::write_input_range] input leaf index " +
+        std::to_string(index) + " out of range (" +
+        std::to_string(impl.inputs.size()) + " leaves).");
+  }
+  std::lock_guard<std::mutex> lk(impl.submit_mtx);
+  auto pool = metal::new_scoped_memory_pool();
+  auto& leaf = impl.inputs[index];
+  // Address stability: the captured buffer must not have moved (allocator reuse),
+  // exactly as write_input_leaf / the feedback blit assert before touching it.
+  auto* cur = static_cast<const MTL::Buffer*>(leaf.buffer().ptr());
+  if (cur != impl.input_bufs[index]) {
+    throw std::runtime_error(
+        "[CaptureReplay::write_input_range] Captured input buffer " +
+        std::to_string(index) +
+        " moved — the arena is no longer address-stable (allocator reuse).");
+  }
+  array s = src;
+  s.eval();
+  const size_t n = s.nbytes();
+  // Bounds within the LEAF's logical bytes (not the whole backing buffer): a
+  // range write may only touch bytes that belong to this leaf, so a bad offset /
+  // length fails cleanly here instead of corrupting a neighbouring suballocation.
+  if (byte_offset + n > leaf.nbytes()) {
+    throw std::out_of_range(
+        "[CaptureReplay::write_input_range] byte_offset " +
+        std::to_string(byte_offset) + " + src nbytes " + std::to_string(n) +
+        " exceeds leaf " + std::to_string(index) + " logical size " +
+        std::to_string(leaf.nbytes()) + ".");
+  }
+  if (n == 0) {
+    return;
+  }
+  // leaf.data() already resolves to buffer base + array.offset(); the caller's
+  // byte_offset is relative to that leaf-data start. src.data() likewise honors
+  // src's own offset, so a contiguous view slice copies the right bytes.
+  std::memcpy(leaf.data<char>() + byte_offset, s.data<const char>(), n);
+}
+
 void CaptureReplay::replay_wait(uint64_t ticket) {
   auto& impl = *impl_;
   auto pool = metal::new_scoped_memory_pool();

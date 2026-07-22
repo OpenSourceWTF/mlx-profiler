@@ -195,6 +195,28 @@ void init_metal(nb::module_& m) {
           dst). Returns a ticket for :func:`replay_wait`.
           )pbdoc")
       .def(
+          "write_input_range",
+          [](mx::metal::CaptureReplay& self,
+             size_t index,
+             size_t byte_offset,
+             mx::array src) {
+            nb::gil_scoped_release nogil;
+            self.write_input_range(index, byte_offset, src);
+          },
+          "index"_a,
+          "byte_offset"_a,
+          "src"_a,
+          R"pbdoc(
+          Sub-leaf range write: memcpy ``src`` (contiguous) into pinned input leaf
+          ``index`` at ``byte_offset`` within that leaf's data, leaving every other
+          byte — and every other leaf — untouched. Address stability is asserted;
+          ``byte_offset + src.nbytes`` must fit the leaf. Does NOT commit — pair
+          range writes with a following :meth:`replay_submit_partial` (small
+          cycle-varying leaves + commit). Used by the S3 draft delta-rewrite to
+          replace the reserved-window K/V memcpy with just the 1-2 appended rows.
+          Serial-use only, like :meth:`replay_submit_partial`.
+          )pbdoc")
+      .def(
           "replay_wait",
           [](mx::metal::CaptureReplay& self, uint64_t ticket) {
             nb::gil_scoped_release nogil;
