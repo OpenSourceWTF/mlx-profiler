@@ -41,18 +41,113 @@ int main(int argc, char** argv) {
         ? fail("disabled census created a file")
         : 0;
   }
+  if (mode == "multi_state") {
+    census::CommandBufferState first;
+    census::CommandBufferState second;
+    const void* first_pipeline = reinterpret_cast<const void*>(uintptr_t{1});
+    const void* second_pipeline = reinterpret_cast<const void*>(uintptr_t{2});
+    census::register_kernel(first_pipeline, "first_kernel");
+    census::register_kernel(second_pipeline, "second_kernel");
+
+    census::note_pipeline(first, first_pipeline);
+    census::note_dispatch(
+        first, "threads", census::Dim3{8, 1, 1}, census::Dim3{4, 1, 1});
+    census::note_pipeline(second, second_pipeline);
+    census::note_dispatch(
+        second, "threads", census::Dim3{16, 1, 1}, census::Dim3{8, 1, 1});
+
+    const uint64_t first_cb = census::note_cb_encode_end(first);
+    const uint64_t second_cb = census::note_cb_encode_end(second);
+    census::note_cb_gpu_times(first_cb, 100.0, 200.0);
+    census::note_cb_gpu_times(second_cb, 300.0, 400.0);
+    census::flush();
+
+    std::ifstream input(path);
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    const std::string jsonl = buffer.str();
+    for (const std::string& required : {
+             "\"seq\":0,\"command_buffer_index\":0",
+             "\"seq\":1,\"command_buffer_index\":1",
+             "\"command_buffer_index\":0,\"op_count\":1",
+             "\"command_buffer_index\":1,\"op_count\":1"}) {
+      if (jsonl.find(required) == std::string::npos) {
+        return fail("multi-state census collision: " + required);
+      }
+    }
+    return 0;
+  }
+  if (mode == "encode_start") {
+    census::CommandBufferState state;
+    const void* pipeline = reinterpret_cast<const void*>(uintptr_t{3});
+    const uint64_t before = census::now_ns();
+    census::note_pipeline(state, pipeline);
+    const uint64_t after = census::now_ns();
+    if (!state.started || state.encode_start_ns < before ||
+        state.encode_start_ns > after) {
+      return fail("encode interval did not start at the first encoder command");
+    }
+    return 0;
+  }
+  if (mode == "pipeline_persistence") {
+    census::CommandBufferState state;
+    const void* pipeline = reinterpret_cast<const void*>(uintptr_t{4});
+    census::register_kernel(pipeline, "persistent_kernel");
+    census::note_pipeline(state, pipeline);
+    census::note_dispatch(
+        state, "threads", census::Dim3{8, 1, 1}, census::Dim3{4, 1, 1});
+    census::note_dispatch(
+        state, "threads", census::Dim3{8, 1, 1}, census::Dim3{4, 1, 1});
+    const uint64_t cb = census::note_cb_encode_end(state);
+    census::note_cb_gpu_times(cb, 100.0, 200.0);
+    census::flush();
+
+    std::ifstream input(path);
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    const std::string jsonl = buffer.str();
+    const std::string kernel = "\"kernel_name\":\"persistent_kernel\"";
+    const size_t first = jsonl.find(kernel);
+    if (first == std::string::npos ||
+        jsonl.find(kernel, first + kernel.size()) == std::string::npos) {
+      return fail("pipeline state did not persist across dispatches");
+    }
+    return 0;
+  }
+  if (mode == "kernel_reregister") {
+    census::CommandBufferState state;
+    const void* pipeline = reinterpret_cast<const void*>(uintptr_t{5});
+    census::register_kernel(pipeline, "stale_kernel");
+    census::register_kernel(pipeline, "replacement_kernel");
+    census::note_pipeline(state, pipeline);
+    census::note_dispatch(
+        state, "threads", census::Dim3{8, 1, 1}, census::Dim3{4, 1, 1});
+    const uint64_t cb = census::note_cb_encode_end(state);
+    census::note_cb_gpu_times(cb, 100.0, 200.0);
+    census::flush();
+
+    std::ifstream input(path);
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    const std::string jsonl = buffer.str();
+    return jsonl.find("\"kernel_name\":\"replacement_kernel\"") ==
+            std::string::npos
+        ? fail("re-registered pipeline retained its stale name")
+        : 0;
+  }
   if (mode != "enabled") {
     return fail("unknown mode");
   }
 
+  census::CommandBufferState state;
   const void* pipeline = reinterpret_cast<const void*>(uintptr_t{1});
   census::register_kernel(pipeline, "cpu_smoke_kernel");
-  census::note_pipeline(pipeline);
-  census::note_set_bytes(16);
-  census::note_buffer_bind();
+  census::note_pipeline(state, pipeline);
+  census::note_set_bytes(state, 16);
+  census::note_buffer_bind(state);
   census::note_dispatch(
-      "threads", census::Dim3{8, 1, 1}, census::Dim3{4, 1, 1});
-  const uint64_t cb = census::note_cb_encode_end();
+      state, "threads", census::Dim3{8, 1, 1}, census::Dim3{4, 1, 1});
+  const uint64_t cb = census::note_cb_encode_end(state);
   census::note_cb_gpu_times(cb, 100.0, 200.0);
   census::note_wait("cap_wait", 1000);
   census::flush();

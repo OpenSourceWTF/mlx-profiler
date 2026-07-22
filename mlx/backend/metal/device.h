@@ -61,7 +61,7 @@ class MLX_API CommandEncoder {
 
   void set_compute_pipeline_state(MTL::ComputePipelineState* kernel) {
     if (census::enabled()) {
-      census::note_pipeline(kernel);
+      census::note_pipeline(census_state_, kernel);
     }
     get_command_encoder()->setComputePipelineState(kernel);
   }
@@ -69,7 +69,8 @@ class MLX_API CommandEncoder {
   template <typename Vec, typename = std::enable_if_t<is_vector_v<Vec>>>
   void set_vector_bytes(const Vec& vec, size_t nelems, int idx) {
     if (census::enabled()) {
-      census::note_set_bytes(nelems * sizeof(typename Vec::value_type));
+      census::note_set_bytes(
+          census_state_, nelems * sizeof(typename Vec::value_type));
     }
     get_command_encoder()->setBytes(
         vec.data(), nelems * sizeof(typename Vec::value_type), idx);
@@ -82,7 +83,7 @@ class MLX_API CommandEncoder {
   template <typename T>
   void set_bytes(const T* v, int n, int idx) {
     if (census::enabled()) {
-      census::note_set_bytes(n * sizeof(T));
+      census::note_set_bytes(census_state_, n * sizeof(T));
     }
     return get_command_encoder()->setBytes(v, n * sizeof(T), idx);
   }
@@ -90,7 +91,7 @@ class MLX_API CommandEncoder {
   template <typename T>
   void set_bytes(const T& v, int idx) {
     if (census::enabled()) {
-      census::note_set_bytes(sizeof(T));
+      census::note_set_bytes(census_state_, sizeof(T));
     }
     return get_command_encoder()->setBytes(&v, sizeof(T), idx);
   }
@@ -126,6 +127,7 @@ class MLX_API CommandEncoder {
   NS::SharedPtr<MTL::CommandBuffer> buffer_;
   int buffer_ops_{0};
   size_t buffer_sizes_{0};
+  census::CommandBufferState census_state_;
 
   // The events hooked to current command buffer.
   std::vector<std::shared_ptr<EventImpl>> wait_events_;

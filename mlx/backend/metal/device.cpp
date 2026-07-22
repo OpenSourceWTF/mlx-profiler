@@ -339,7 +339,7 @@ void CommandEncoder::set_buffer(
   all_inputs_.insert((void*)buf);
   all_outputs_.insert((void*)buf);
   if (census::enabled()) {
-    census::note_buffer_bind();
+    census::note_buffer_bind(census_state_);
   }
   get_command_encoder()->setBuffer(buf, offset, idx);
 }
@@ -359,7 +359,7 @@ void CommandEncoder::set_input_array(
   // set_output_array routes through here, so this single hook counts input and
   // output array binds.
   if (census::enabled()) {
-    census::note_buffer_bind();
+    census::note_buffer_bind(census_state_);
   }
   get_command_encoder()->setBuffer(a_buf, a.offset() + offset, idx);
 }
@@ -420,6 +420,7 @@ void CommandEncoder::dispatch_threadgroups(
   get_command_encoder()->dispatchThreadgroups(grid_dims, group_dims);
   if (census::enabled()) {
     census::note_dispatch(
+        census_state_,
         "threadgroups",
         census::Dim3{grid_dims.width, grid_dims.height, grid_dims.depth},
         census::Dim3{group_dims.width, group_dims.height, group_dims.depth});
@@ -434,6 +435,7 @@ void CommandEncoder::dispatch_threads(
   get_command_encoder()->dispatchThreads(grid_dims, group_dims);
   if (census::enabled()) {
     census::note_dispatch(
+        census_state_,
         "threads",
         census::Dim3{grid_dims.width, grid_dims.height, grid_dims.depth},
         census::Dim3{group_dims.width, group_dims.height, group_dims.depth});
@@ -542,7 +544,7 @@ void CommandEncoder::commit(std::function<void()> completion) {
     // attach GPU execution times from its completion handler. GPUStartTime /
     // GPUEndTime are seconds in the CACurrentMediaTime (mach-absolute) domain,
     // matching census::now_ns(), so encode-vs-execute overlap is comparable.
-    const uint64_t cb_index = census::note_cb_encode_end();
+    const uint64_t cb_index = census::note_cb_encode_end(census_state_);
     buffer_->addCompletedHandler([cb_index](MTL::CommandBuffer* cbuf) {
       census::note_cb_gpu_times(
           cb_index, cbuf->GPUStartTime() * 1e9, cbuf->GPUEndTime() * 1e9);

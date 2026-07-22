@@ -5,10 +5,13 @@
 #include "mlx/backend/common/dispatch_census.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <map>
+#if defined(__APPLE__)
 #include <mach/mach_time.h>
+#endif
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -43,12 +46,18 @@ int parse_max_active_tasks(const char* value) {
 }
 
 uint64_t now_ns() {
+#if defined(__APPLE__)
   static mach_timebase_info_data_t tb = [] {
     mach_timebase_info_data_t t;
     mach_timebase_info(&t);
     return t;
   }();
   return mach_absolute_time() * tb.numer / tb.denom;
+#else
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+#endif
 }
 
 namespace {
@@ -114,25 +123,6 @@ std::unordered_map<const void*, std::string> g_names;
 std::atomic<uint64_t> g_seq{0};
 std::atomic<uint64_t> g_cb_counter{0};
 
-struct Pending {
-  const void* pipeline = nullptr;
-  uint32_t set_bytes_calls = 0;
-  uint64_t set_bytes_total_bytes = 0;
-  uint32_t buffer_binds = 0;
-};
-thread_local Pending g_pending;
-
-// ---- per-command-buffer accumulator --------------------------------------
-struct CbAccum {
-  bool started = false;
-  uint64_t uid = 0;
-  uint64_t encode_start_ns = 0;
-  uint64_t first_op_seq = 0;
-  uint64_t last_op_seq = 0;
-  uint64_t op_count = 0;
-};
-thread_local CbAccum g_cb;
-
 struct CbRecord {
   uint64_t encode_start_ns = 0;
   uint64_t encode_end_ns = 0;
@@ -158,6 +148,17 @@ std::string resolve_name(const void* pipeline) {
   std::lock_guard<std::mutex> lk(g_name_mtx);
   auto it = g_names.find(pipeline);
   return it == g_names.end() ? std::string("<unknown>") : it->second;
+}
+
+void note_encode_begin(CommandBufferState& state) {
+  if (!state.started) {
+    state.started = true;
+    state.uid = g_cb_counter.fetch_add(1, std::memory_order_relaxed);
+    state.encode_start_ns = now_ns();
+    state.first_op_seq = 0;
+    state.last_op_seq = 0;
+    state.op_count = 0;
+  }
 }
 
 // Dump the accumulated bucket table as one summary line.
@@ -206,67 +207,70 @@ void register_kernel(const void* pipeline, const char* name) {
     return;
   }
   std::lock_guard<std::mutex> lk(g_name_mtx);
-  g_names.emplace(pipeline, std::string(name));
+  g_names.insert_or_assign(pipeline, std::string(name));
 }
 
-void note_pipeline(const void* pipeline) {
+void note_pipeline(CommandBufferState& state, const void* pipeline) {
   if (!detail::g_enabled) {
     return;
   }
-  g_pending.pipeline = pipeline;
+  note_encode_begin(state);
+  state.pipeline = pipeline;
 }
 
-void note_set_bytes(std::size_t nbytes) {
+void note_set_bytes(CommandBufferState& state, std::size_t nbytes) {
   if (!detail::g_enabled) {
     return;
   }
-  g_pending.set_bytes_calls += 1;
-  g_pending.set_bytes_total_bytes += nbytes;
+  note_encode_begin(state);
+  state.set_bytes_calls += 1;
+  state.set_bytes_total_bytes += nbytes;
 }
 
-void note_buffer_bind() {
+void note_buffer_bind(CommandBufferState& state) {
   if (!detail::g_enabled) {
     return;
   }
-  g_pending.buffer_binds += 1;
+  note_encode_begin(state);
+  state.buffer_binds += 1;
 }
 
-void note_dispatch(const char* dispatch_kind, Dim3 grid, Dim3 threadgroup) {
+void note_dispatch(
+    CommandBufferState& state,
+    const char* dispatch_kind,
+    Dim3 grid,
+    Dim3 threadgroup) {
   if (!detail::g_enabled) {
     return;
   }
 
   const uint64_t seq = g_seq.fetch_add(1, std::memory_order_relaxed);
 
-  // Start a new command-buffer accumulator on the first op after a commit.
-  if (!g_cb.started) {
-    g_cb.started = true;
-    g_cb.uid = g_cb_counter.fetch_add(1, std::memory_order_relaxed);
-    g_cb.encode_start_ns = now_ns();
-    g_cb.first_op_seq = seq;
-    g_cb.op_count = 0;
+  note_encode_begin(state);
+  if (state.op_count == 0) {
+    state.first_op_seq = seq;
   }
-  g_cb.last_op_seq = seq;
-  g_cb.op_count += 1;
+  state.last_op_seq = seq;
+  state.op_count += 1;
 
-  const std::string name = resolve_name(g_pending.pipeline);
+  const std::string name = resolve_name(state.pipeline);
 
   std::string line;
   line.reserve(288);
   line += "{\"record\":\"op\",\"seq\":";
   line += std::to_string(seq);
   line += ",\"command_buffer_index\":";
-  line += std::to_string(g_cb.uid);
+  line += std::to_string(state.uid);
   line += ",\"kind\":\"compute\",\"dispatch\":";
   append_json_string(line, dispatch_kind ? dispatch_kind : "");
   line += ",\"kernel_name\":";
   append_json_string(line, name);
   line += ",\"setBytes_calls\":";
-  line += std::to_string(g_pending.set_bytes_calls);
+  line += std::to_string(state.set_bytes_calls);
   line += ",\"setBytes_total_bytes\":";
-  line += std::to_string(g_pending.set_bytes_total_bytes);
+  line += std::to_string(state.set_bytes_total_bytes);
   line += ",\"buffer_binds\":";
-  line += std::to_string(g_pending.buffer_binds);
+  line += std::to_string(state.buffer_binds);
   line += ",\"grid\":[";
   line += std::to_string(grid.x) + "," + std::to_string(grid.y) + "," +
       std::to_string(grid.z);
@@ -277,25 +281,24 @@ void note_dispatch(const char* dispatch_kind, Dim3 grid, Dim3 threadgroup) {
   write_line(line);
 
   // Reset per-command accumulators; the next command starts clean.
-  g_pending.pipeline = nullptr;
-  g_pending.set_bytes_calls = 0;
-  g_pending.set_bytes_total_bytes = 0;
-  g_pending.buffer_binds = 0;
+  state.set_bytes_calls = 0;
+  state.set_bytes_total_bytes = 0;
+  state.buffer_binds = 0;
 }
 
-uint64_t note_cb_encode_end() {
+uint64_t note_cb_encode_end(CommandBufferState& state) {
   if (!detail::g_enabled) {
     return 0;
   }
   const uint64_t end_ns = now_ns();
   uint64_t uid;
   CbRecord rec;
-  if (g_cb.started) {
-    uid = g_cb.uid;
-    rec.encode_start_ns = g_cb.encode_start_ns;
-    rec.first_op_seq = g_cb.first_op_seq;
-    rec.last_op_seq = g_cb.last_op_seq;
-    rec.op_count = g_cb.op_count;
+  if (state.started) {
+    uid = state.uid;
+    rec.encode_start_ns = state.encode_start_ns;
+    rec.first_op_seq = state.first_op_seq;
+    rec.last_op_seq = state.last_op_seq;
+    rec.op_count = state.op_count;
   } else {
     // Committed with no ops encoded (e.g. an empty finalize).
     uid = g_cb_counter.fetch_add(1, std::memory_order_relaxed);
@@ -309,7 +312,7 @@ uint64_t note_cb_encode_end() {
     std::lock_guard<std::mutex> lk(g_cb_mtx);
     g_cb_records[uid] = rec;
   }
-  g_cb.started = false; // next op opens a fresh command buffer
+  state.started = false; // next op opens a fresh command buffer
   return uid;
 }
 

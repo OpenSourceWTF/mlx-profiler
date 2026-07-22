@@ -39,6 +39,21 @@ struct Dim3 {
   uint64_t z;
 };
 
+// Per-CommandEncoder census state. MLX may interleave multiple streams on one
+// host thread, so command-buffer ownership cannot be thread-local.
+struct CommandBufferState {
+  const void* pipeline = nullptr;
+  uint32_t set_bytes_calls = 0;
+  uint64_t set_bytes_total_bytes = 0;
+  uint32_t buffer_binds = 0;
+  bool started = false;
+  uint64_t uid = 0;
+  uint64_t encode_start_ns = 0;
+  uint64_t first_op_seq = 0;
+  uint64_t last_op_seq = 0;
+  uint64_t op_count = 0;
+};
+
 namespace detail {
 // Defined in dispatch_census.cpp; initialised at static-init from getenv.
 extern bool g_enabled;
@@ -68,10 +83,14 @@ void register_kernel(const void* pipeline, const char* name);
 // Per-dispatch accumulation. Command boundary: bind pipeline, set arguments
 // (setBytes + buffers), then dispatch. note_dispatch emits the "op" line and
 // resets the per-command accumulators.
-void note_pipeline(const void* pipeline);
-void note_set_bytes(std::size_t nbytes);
-void note_buffer_bind();
-void note_dispatch(const char* dispatch_kind, Dim3 grid, Dim3 threadgroup);
+void note_pipeline(CommandBufferState& state, const void* pipeline);
+void note_set_bytes(CommandBufferState& state, std::size_t nbytes);
+void note_buffer_bind(CommandBufferState& state);
+void note_dispatch(
+    CommandBufferState& state,
+    const char* dispatch_kind,
+    Dim3 grid,
+    Dim3 threadgroup);
 
 // --- Per-command-buffer timeline ------------------------------------------
 
@@ -79,7 +98,7 @@ void note_dispatch(const char* dispatch_kind, Dim3 grid, Dim3 threadgroup);
 // encode-end time, first/last op seq and op count; advance the command-buffer
 // index used by subsequent "op" lines; and return the index just committed so
 // the caller can attach GPU times from that buffer's completion handler.
-uint64_t note_cb_encode_end();
+uint64_t note_cb_encode_end(CommandBufferState& state);
 
 // Attach GPU execution times (nanoseconds, mach-absolute domain: pass
 // GPUStartTime()*1e9 and GPUEndTime()*1e9) to a previously finalized command

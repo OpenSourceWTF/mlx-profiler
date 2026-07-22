@@ -47,6 +47,13 @@ add_executable(dispatch_census_smoke dispatch_census_smoke.cpp)
 target_link_libraries(dispatch_census_smoke PRIVATE mlx)
 set(CENSUS_ON ${CMAKE_CURRENT_BINARY_DIR}/dispatch-census-enabled.jsonl)
 set(CENSUS_OFF ${CMAKE_CURRENT_BINARY_DIR}/dispatch-census-disabled.jsonl)
+set(CENSUS_MULTI ${CMAKE_CURRENT_BINARY_DIR}/dispatch-census-multi-state.jsonl)
+set(CENSUS_ENCODE_START
+    ${CMAKE_CURRENT_BINARY_DIR}/dispatch-census-encode-start.jsonl)
+set(CENSUS_PIPELINE
+    ${CMAKE_CURRENT_BINARY_DIR}/dispatch-census-pipeline-persistence.jsonl)
+set(CENSUS_REREGISTER
+    ${CMAKE_CURRENT_BINARY_DIR}/dispatch-census-kernel-reregister.jsonl)
 add_test(
   NAME dispatch_census_disabled
   COMMAND ${CMAKE_COMMAND} -E env --unset=MLX_DISPATCH_CENSUS
@@ -55,6 +62,31 @@ add_test(
   NAME dispatch_census_enabled
   COMMAND ${CMAKE_COMMAND} -E env MLX_DISPATCH_CENSUS=${CENSUS_ON}
           $<TARGET_FILE:dispatch_census_smoke> enabled ${CENSUS_ON})
+add_test(
+  NAME dispatch_census_multi_state
+  COMMAND ${CMAKE_COMMAND} -E env MLX_DISPATCH_CENSUS=${CENSUS_MULTI}
+          $<TARGET_FILE:dispatch_census_smoke> multi_state ${CENSUS_MULTI})
+add_test(
+  NAME dispatch_census_encode_start
+  COMMAND ${CMAKE_COMMAND} -E env MLX_DISPATCH_CENSUS=${CENSUS_ENCODE_START}
+          $<TARGET_FILE:dispatch_census_smoke> encode_start
+          ${CENSUS_ENCODE_START})
+add_test(
+  NAME dispatch_census_pipeline_persistence
+  COMMAND ${CMAKE_COMMAND} -E env MLX_DISPATCH_CENSUS=${CENSUS_PIPELINE}
+          $<TARGET_FILE:dispatch_census_smoke> pipeline_persistence
+          ${CENSUS_PIPELINE})
+add_test(
+  NAME dispatch_census_kernel_reregister
+  COMMAND ${CMAKE_COMMAND} -E env MLX_DISPATCH_CENSUS=${CENSUS_REREGISTER}
+          $<TARGET_FILE:dispatch_census_smoke> kernel_reregister
+          ${CENSUS_REREGISTER})
+add_test(
+  NAME dispatch_census_portable_clock
+  COMMAND
+    ${CMAKE_COMMAND}
+    -DSOURCE=${PROJECT_SOURCE_DIR}/mlx/backend/common/dispatch_census.cpp -P
+    ${CMAKE_CURRENT_SOURCE_DIR}/dispatch_census_portability.cmake)
 
 if(APPLE)
   add_test(
