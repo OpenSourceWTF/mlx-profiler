@@ -133,26 +133,31 @@ Buffer MetalAllocator::malloc(size_t size) {
     census::note_wait("alloc_calls", 0);
   }
   uint64_t lock_t0 = census_on ? census::now_ns() : 0;
+  uint64_t lock_wait_ns = 0;
+  uint64_t gc_wait_ns = 0;
+  uint64_t new_buffer_wait_ns = 0;
+  bool cache_hit = false;
+  bool ran_gc = false;
+  bool allocated_buffer = false;
 
   // Try the cache
   std::unique_lock lk(mutex_);
   if (census_on) {
-    census::note_wait("alloc_lock", census::now_ns() - lock_t0);
+    lock_wait_ns = census::now_ns() - lock_t0;
   }
   MTL::Buffer* buf = buffer_cache_.reuse_from_cache(size);
-  if (census_on && buf) {
-    census::note_wait("alloc_cache_hit", 0);
-  }
+  cache_hit = buf != nullptr;
   if (!buf) {
     size_t mem_required = get_active_memory() + get_cache_memory() + size;
 
     // If we have a lot of memory pressure try to reclaim memory from the cache
     if (mem_required >= gc_limit_ || num_resources_ >= resource_limit_) {
       uint64_t gc_t0 = census_on ? census::now_ns() : 0;
+      ran_gc = true;
       num_resources_ -=
           buffer_cache_.release_cached_buffers(mem_required - gc_limit_);
       if (census_on) {
-        census::note_wait("alloc_gc", census::now_ns() - gc_t0);
+        gc_wait_ns = census::now_ns() - gc_t0;
       }
     }
 
@@ -172,7 +177,8 @@ Buffer MetalAllocator::malloc(size_t size) {
       buf = device_->newBuffer(size, resource_options);
     }
     if (census_on && buf) {
-      census::note_wait("alloc_new_buffer", census::now_ns() - nb_t0);
+      new_buffer_wait_ns = census::now_ns() - nb_t0;
+      allocated_buffer = true;
     }
     if (!buf) {
       std::ostringstream msg;
@@ -193,6 +199,20 @@ Buffer MetalAllocator::malloc(size_t size) {
   if (get_cache_memory() > max_pool_size_) {
     num_resources_ -= buffer_cache_.release_cached_buffers(
         get_cache_memory() - max_pool_size_);
+  }
+
+  lk.unlock();
+  if (census_on) {
+    census::note_wait("alloc_lock", lock_wait_ns);
+    if (cache_hit) {
+      census::note_wait("alloc_cache_hit", 0);
+    }
+    if (ran_gc) {
+      census::note_wait("alloc_gc", gc_wait_ns);
+    }
+    if (allocated_buffer) {
+      census::note_wait("alloc_new_buffer", new_buffer_wait_ns);
+    }
   }
 
   return Buffer{static_cast<void*>(buf)};

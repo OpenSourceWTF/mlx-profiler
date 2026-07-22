@@ -309,6 +309,9 @@ CommandEncoder::CommandEncoder(
     int index,
     ResidencySet& residency_set)
     : device_(d) {
+  if (census::enabled()) {
+    census::initialize();
+  }
   auto pool = new_scoped_memory_pool();
   queue_ = NS::TransferPtr(device_.mtl_device()->newCommandQueue());
   if (!queue_) {
@@ -539,17 +542,12 @@ bool CommandEncoder::needs_commit() const {
 }
 
 void CommandEncoder::commit(std::function<void()> completion) {
-  if (census::enabled()) {
-    // Finalize the host encode window for the buffer about to be committed and
-    // attach GPU execution times from its completion handler. GPUStartTime /
-    // GPUEndTime are seconds in the CACurrentMediaTime (mach-absolute) domain,
-    // matching census::now_ns(), so encode-vs-execute overlap is comparable.
-    const uint64_t cb_index = census::note_cb_encode_end(census_state_);
-    buffer_->addCompletedHandler([cb_index](MTL::CommandBuffer* cbuf) {
-      census::note_cb_gpu_times(
-          cb_index, cbuf->GPUStartTime() * 1e9, cbuf->GPUEndTime() * 1e9);
-    });
-  }
+  const bool census_on = census::enabled();
+  // Finalize the host encode window before commit. The census completion
+  // handler is installed after MLX's runtime handler so profiling can never
+  // delay task completion, event poisoning, or scheduler progress.
+  const uint64_t cb_index =
+      census_on ? census::note_cb_encode_end(census_state_) : 0;
   buffer_->addCompletedHandler(
       [&error_ = error_,
        wait_events = std::move(wait_events_),
@@ -586,6 +584,12 @@ void CommandEncoder::commit(std::function<void()> completion) {
           }
         }
       });
+  if (census_on) {
+    buffer_->addCompletedHandler([cb_index](MTL::CommandBuffer* cbuf) {
+      census::note_cb_gpu_times(
+          cb_index, cbuf->GPUStartTime() * 1e9, cbuf->GPUEndTime() * 1e9);
+    });
+  }
   buffer_->commit();
   buffer_ = NS::RetainPtr(queue_->commandBufferWithUnretainedReferences());
   buffer_ops_ = 0;

@@ -21,7 +21,13 @@ MLX_DISPATCH_CENSUS=/absolute/path/census.jsonl \
 ```
 
 When the variable is absent or empty, the sink does not create an output file.
-When enabled, the JSONL contains these record types:
+The disabled path performs only a cached flag check at each hook; it creates no
+sink state or writer thread. When enabled, producers enqueue records to a
+dedicated writer so filesystem I/O cannot block Metal completion handlers or
+MLX scheduler and allocator locks.
+
+Every row currently carries `"schema_version":1`. When enabled, the JSONL
+contains these record types:
 
 - `op`: kernel name, dispatch geometry, argument bytes, buffer binds, sequence,
   and command-buffer identity.
@@ -31,7 +37,9 @@ When enabled, the JSONL contains these record types:
   wait. Waits below 250 ns remain in the summary totals without emitting an
   individual row.
 - `summary`: total operations, command buffers, and counts and durations by
-  wait bucket. It is written at process teardown.
+  wait bucket. Synchronization emits a numbered `final:false` snapshot; process
+  teardown emits one terminal `final:true` snapshot without forcing a GPU
+  drain.
 
 `MLX_MAX_ACTIVE_TASKS` optionally changes the asynchronous evaluation task cap
 for diagnostics. Its upstream-compatible default remains `10`; valid values are
@@ -46,8 +54,9 @@ Drop a census JSONL file onto the
 
 The Command Line Tools SDK does not ship Apple's Metal compiler. Build a
 metallib from this exact source revision on a machine with full Xcode, then pass
-that artifact to the CLT build. Never reuse a metallib from a different MLX
-revision.
+that artifact and its generated adjacent `.manifest` to the CLT build. CMake
+rejects missing manifests, artifact hash changes, kernel-source changes, and
+Metal/SDK/build-setting mismatches.
 
 ```bash
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
@@ -58,6 +67,8 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
 
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   cmake --build build/native-metallib --target mlx-metallib
+
+# If the artifact is moved, move mlx.metallib.manifest beside it too.
 
 cmake -S . -B build/cr \
   -DCMAKE_BUILD_TYPE=Release \
@@ -73,7 +84,8 @@ PYTHONPATH="$PWD/python" python -c \
 ```
 
 The final import path must resolve inside this checkout. The CMake install
-target is the build gate; editor-only clangd diagnostics are not.
+target is the build gate; editor-only clangd diagnostics are not. The install
+contains both `mlx.metallib` and its verified manifest.
 
 ## CPU contract tests
 

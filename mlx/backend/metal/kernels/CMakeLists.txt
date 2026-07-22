@@ -9,6 +9,28 @@ set(BASE_HEADERS
     logging.h
     utils.h)
 
+# Fingerprint every Metal source/header, plus the compiler-facing configuration
+# that selects kernels. A prebuilt library is accepted only with a sidecar
+# manifest produced from the same inputs.
+file(
+  GLOB_RECURSE MLX_METALLIB_SOURCE_INPUTS
+  CONFIGURE_DEPENDS
+  LIST_DIRECTORIES false
+  "${CMAKE_CURRENT_SOURCE_DIR}/*.h"
+  "${CMAKE_CURRENT_SOURCE_DIR}/*.metal")
+list(SORT MLX_METALLIB_SOURCE_INPUTS)
+set(MLX_METALLIB_SOURCE_FINGERPRINT "")
+foreach(SOURCE_INPUT IN LISTS MLX_METALLIB_SOURCE_INPUTS)
+  file(SHA256 "${SOURCE_INPUT}" SOURCE_INPUT_SHA256)
+  file(RELATIVE_PATH SOURCE_INPUT_RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
+       "${SOURCE_INPUT}")
+  string(APPEND MLX_METALLIB_SOURCE_FINGERPRINT
+         "${SOURCE_INPUT_RELATIVE}:${SOURCE_INPUT_SHA256}\n")
+endforeach()
+string(SHA256 MLX_METALLIB_SOURCE_SHA256
+       "${MLX_METALLIB_SOURCE_FINGERPRINT}")
+set(MLX_METALLIB_MANIFEST ${MLX_METAL_PATH}/mlx.metallib.manifest)
+
 function(build_kernel_base TARGET SRCFILE DEPS)
   # CLT-only build: no Metal compiler, the metallib is supplied prebuilt, so the
   # per-kernel .air compile is skipped entirely.
@@ -207,18 +229,78 @@ if(MLX_METAL_PREBUILT_LIB)
       FATAL_ERROR
         "MLX_METAL_PREBUILT_LIB does not exist: ${MLX_METAL_PREBUILT_LIB}")
   endif()
+  set(MLX_METAL_PREBUILT_MANIFEST
+      "${MLX_METAL_PREBUILT_LIB}.manifest")
+  if(NOT EXISTS "${MLX_METAL_PREBUILT_MANIFEST}")
+    message(
+      FATAL_ERROR
+        "MLX_METAL_PREBUILT_LIB requires an adjacent source manifest: "
+        "${MLX_METAL_PREBUILT_MANIFEST}")
+  endif()
+  file(READ "${MLX_METAL_PREBUILT_MANIFEST}" PREBUILT_MANIFEST)
+  file(SHA256 "${MLX_METAL_PREBUILT_LIB}" PREBUILT_ARTIFACT_SHA256)
+  foreach(MANIFEST_FIELD
+          artifact_sha256
+          source_sha256
+          metal_version
+          macos_sdk
+          deployment_target
+          metal_jit
+          metal_debug
+          build_type)
+    unset(CMAKE_MATCH_1)
+    string(REGEX MATCH "${MANIFEST_FIELD}=([^\n]+)" _MATCH
+                 "${PREBUILT_MANIFEST}")
+    if("${CMAKE_MATCH_1}" STREQUAL "")
+      message(
+        FATAL_ERROR
+          "Invalid metallib manifest: missing ${MANIFEST_FIELD} in "
+          "${MLX_METAL_PREBUILT_MANIFEST}")
+    endif()
+    set(PREBUILT_${MANIFEST_FIELD} "${CMAKE_MATCH_1}")
+  endforeach()
+  if(NOT PREBUILT_artifact_sha256 STREQUAL PREBUILT_ARTIFACT_SHA256
+     OR NOT PREBUILT_source_sha256 STREQUAL MLX_METALLIB_SOURCE_SHA256
+     OR NOT PREBUILT_metal_version STREQUAL "${MLX_METAL_VERSION}"
+     OR NOT PREBUILT_macos_sdk STREQUAL "${MACOS_SDK_VERSION}"
+     OR NOT PREBUILT_deployment_target STREQUAL
+            "${CMAKE_OSX_DEPLOYMENT_TARGET}"
+     OR NOT PREBUILT_metal_jit STREQUAL "${MLX_METAL_JIT}"
+     OR NOT PREBUILT_metal_debug STREQUAL "${MLX_METAL_DEBUG}"
+     OR NOT PREBUILT_build_type STREQUAL "${CMAKE_BUILD_TYPE}")
+    message(
+      FATAL_ERROR
+        "MLX_METAL_PREBUILT_LIB manifest does not match this source/build: "
+        "${MLX_METAL_PREBUILT_MANIFEST}")
+  endif()
   configure_file(${MLX_METAL_PREBUILT_LIB} ${MLX_METAL_PATH}/mlx.metallib
+                 COPYONLY)
+  configure_file(${MLX_METAL_PREBUILT_MANIFEST} ${MLX_METALLIB_MANIFEST}
                  COPYONLY)
 else()
   add_custom_command(
-    OUTPUT ${MLX_METAL_PATH}/mlx.metallib
+    OUTPUT ${MLX_METAL_PATH}/mlx.metallib ${MLX_METALLIB_MANIFEST}
     COMMAND xcrun -sdk macosx metal ${METAL_LINK_FLAGS} ${KERNEL_AIR} -o
-            ${MLX_METAL_PATH}/mlx.metallib
+          ${MLX_METAL_PATH}/mlx.metallib
+    COMMAND
+      ${CMAKE_COMMAND}
+      "-DMLX_METALLIB=${MLX_METAL_PATH}/mlx.metallib"
+      "-DMLX_MANIFEST=${MLX_METALLIB_MANIFEST}"
+      "-DMLX_SOURCE_SHA256=${MLX_METALLIB_SOURCE_SHA256}"
+      "-DMLX_METAL_VERSION=${MLX_METAL_VERSION}"
+      "-DMLX_MACOS_SDK_VERSION=${MACOS_SDK_VERSION}"
+      "-DMLX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}"
+      "-DMLX_METAL_JIT=${MLX_METAL_JIT}"
+      "-DMLX_METAL_DEBUG=${MLX_METAL_DEBUG}"
+      "-DMLX_BUILD_TYPE=${CMAKE_BUILD_TYPE}" -P
+      ${CMAKE_CURRENT_SOURCE_DIR}/write_metallib_manifest.cmake
     DEPENDS ${KERNEL_AIR}
     COMMENT "Building mlx.metallib"
     VERBATIM)
 
-  add_custom_target(mlx-metallib DEPENDS ${MLX_METAL_PATH}/mlx.metallib)
+  add_custom_target(
+    mlx-metallib
+    DEPENDS ${MLX_METAL_PATH}/mlx.metallib ${MLX_METALLIB_MANIFEST})
 
   add_dependencies(mlx mlx-metallib)
 endif()
@@ -227,6 +309,6 @@ endif()
 include(GNUInstallDirs)
 
 install(
-  FILES ${MLX_METAL_PATH}/mlx.metallib
+  FILES ${MLX_METAL_PATH}/mlx.metallib ${MLX_METALLIB_MANIFEST}
   DESTINATION ${CMAKE_INSTALL_LIBDIR}
   COMPONENT metallib)

@@ -38,20 +38,28 @@ struct StreamThread {
   void thread_fn() {
     while (true) {
       std::function<void()> task;
+      uint64_t wait_ns = 0;
+      bool should_stop = false;
       {
         std::unique_lock<std::mutex> lk(mtx);
         uint64_t wait_t0 = census::enabled() ? census::now_ns() : 0;
         cond.wait(lk, [this] { return !this->q.empty() || this->stop; });
         if (census::enabled()) {
-          census::note_wait("sched_worker_wait", census::now_ns() - wait_t0);
+          wait_ns = census::now_ns() - wait_t0;
         }
         if (q.empty() && stop) {
-          return;
+          should_stop = true;
+        } else {
+          task = std::move(q.front());
+          q.pop();
         }
-        task = std::move(q.front());
-        q.pop();
       }
-
+      if (census::enabled()) {
+        census::note_wait("sched_worker_wait", wait_ns);
+      }
+      if (should_stop) {
+        return;
+      }
       task();
     }
   }
@@ -103,16 +111,24 @@ class MLX_API Scheduler {
   }
 
   void wait_for_one() {
-    std::unique_lock<std::mutex> lk(mtx);
-    int n_tasks_old = n_active_tasks();
-    if (n_tasks_old > 1) {
-      uint64_t wait_t0 = census::enabled() ? census::now_ns() : 0;
-      completion_cv.wait(lk, [this, n_tasks_old] {
-        return this->n_active_tasks() < n_tasks_old;
-      });
-      if (census::enabled()) {
-        census::note_wait("sched_backpressure", census::now_ns() - wait_t0);
+    uint64_t wait_ns = 0;
+    bool waited = false;
+    {
+      std::unique_lock<std::mutex> lk(mtx);
+      int n_tasks_old = n_active_tasks();
+      if (n_tasks_old > 1) {
+        uint64_t wait_t0 = census::enabled() ? census::now_ns() : 0;
+        completion_cv.wait(lk, [this, n_tasks_old] {
+          return this->n_active_tasks() < n_tasks_old;
+        });
+        if (census::enabled()) {
+          wait_ns = census::now_ns() - wait_t0;
+          waited = true;
+        }
       }
+    }
+    if (waited) {
+      census::note_wait("sched_backpressure", wait_ns);
     }
   }
 

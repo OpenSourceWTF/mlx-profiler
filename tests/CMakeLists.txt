@@ -54,6 +54,12 @@ set(CENSUS_PIPELINE
     ${CMAKE_CURRENT_BINARY_DIR}/dispatch-census-pipeline-persistence.jsonl)
 set(CENSUS_REREGISTER
     ${CMAKE_CURRENT_BINARY_DIR}/dispatch-census-kernel-reregister.jsonl)
+set(CENSUS_INVALID
+    ${CMAKE_CURRENT_BINARY_DIR}/missing-census-dir/census.jsonl)
+set(CENSUS_SNAPSHOT
+    ${CMAKE_CURRENT_BINARY_DIR}/dispatch-census-path-snapshot.jsonl)
+set(CENSUS_FINALIZE
+    ${CMAKE_CURRENT_BINARY_DIR}/dispatch-census-finalize.jsonl)
 add_test(
   NAME dispatch_census_disabled
   COMMAND ${CMAKE_COMMAND} -E env --unset=MLX_DISPATCH_CENSUS
@@ -87,8 +93,26 @@ add_test(
     ${CMAKE_COMMAND}
     -DSOURCE=${PROJECT_SOURCE_DIR}/mlx/backend/common/dispatch_census.cpp -P
     ${CMAKE_CURRENT_SOURCE_DIR}/dispatch_census_portability.cmake)
+add_test(
+  NAME dispatch_census_invalid_path
+  COMMAND ${CMAKE_COMMAND} -E env MLX_DISPATCH_CENSUS=${CENSUS_INVALID}
+          $<TARGET_FILE:dispatch_census_smoke> invalid_path ${CENSUS_INVALID})
+add_test(
+  NAME dispatch_census_path_snapshot
+  COMMAND ${CMAKE_COMMAND} -E env MLX_DISPATCH_CENSUS=${CENSUS_SNAPSHOT}
+          $<TARGET_FILE:dispatch_census_smoke> path_snapshot ${CENSUS_SNAPSHOT})
+add_test(
+  NAME dispatch_census_finalize
+  COMMAND ${CMAKE_COMMAND} -E env MLX_DISPATCH_CENSUS=${CENSUS_FINALIZE}
+          $<TARGET_FILE:dispatch_census_smoke> finalize ${CENSUS_FINALIZE})
 
 if(APPLE)
+  set(CENSUS_FIFO ${CMAKE_CURRENT_BINARY_DIR}/dispatch-census-sink.fifo)
+  add_test(
+    NAME dispatch_census_nonblocking_sink
+    COMMAND ${CMAKE_COMMAND} -E env MLX_DISPATCH_CENSUS=${CENSUS_FIFO}
+            $<TARGET_FILE:dispatch_census_smoke> nonblocking_sink
+            ${CENSUS_FIFO})
   add_test(
     NAME clt_preamble_excludes_stub_headers
     COMMAND

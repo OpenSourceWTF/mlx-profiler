@@ -45,8 +45,9 @@ option(MLX_METAL_JIT "Use JIT compilation for Metal kernels" OFF)
 option(MLX_USE_CCACHE "Use CCache for compilation cache when available" ON)
 # Reuse a prebuilt mlx.metallib instead of compiling Metal kernels, for boxes
 # with only the Command Line Tools (no Metal compiler). The metallib MUST match
-# the source version exactly (same kernels/ABI). See mlx/backend/metal/kernels
-# and make_compiled_preamble.sh for how the kernel compile + JIT-preamble
+# the source version exactly (same kernels/ABI); an adjacent generated manifest
+# enforces that match. See mlx/backend/metal/kernels and
+# make_compiled_preamble.sh for how the kernel compile + JIT-preamble
 # enumeration are made metal-compiler-free.
 set(MLX_METAL_PREBUILT_LIB
     ""

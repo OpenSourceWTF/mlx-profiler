@@ -22,8 +22,8 @@
 // backend, the allocator, and the core scheduler can all feed it without a
 // layering violation and without breaking non-Metal builds.
 //
-// Zero overhead when MLX_DISPATCH_CENSUS is unset: enabled() reads one cached
-// bool initialised at static-init, and every hook site guards on it.
+// Minimal disabled-path overhead: enabled() reads one cached bool and every hook
+// site guards on it. No sink state, output file, or writer thread is created.
 
 #pragma once
 
@@ -63,6 +63,14 @@ extern bool g_enabled;
 inline bool enabled() {
   return detail::g_enabled;
 }
+
+// Open and validate the configured sink before entering the measured lane.
+// Throws once with a clear diagnostic if the configured path is unusable.
+void initialize();
+
+// Stop accepting records, wait for in-flight producers, emit one final summary,
+// and flush. Idempotent; callback-visible storage remains valid until exit.
+void finalize();
 
 // Parse the diagnostics-only async-eval task cap. Invalid and absent values
 // preserve MLX's upstream default of 10.
@@ -111,7 +119,7 @@ void note_cb_gpu_times(uint64_t cb_index, double gpu_start_ns, double gpu_end_ns
 // accumulates a per-bucket total dumped at flush.
 void note_wait(const char* bucket, uint64_t wait_ns);
 
-// Flush the JSONL sink (call at stream synchronize; also runs at process exit).
+// Emit a non-final summary snapshot and flush queued rows to the sink.
 void flush();
 
 } // namespace mlx::core::census

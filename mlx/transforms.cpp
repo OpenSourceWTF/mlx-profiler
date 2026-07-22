@@ -290,18 +290,28 @@ array eval_impl(std::vector<array> outputs, bool async) {
           gpu::finalize(s);
         }
       }
-      // Price the throttle wait that the active-task cap forces. The census
-      // "cap_wait" bucket's count is how many times per run the cap blocked and
-      // its total_ns is the aggregate stall — the direct test of whether the
-      // cap (not Metal/allocator/scheduler) explains the measured cv-wait.
-      uint64_t cap_t0 = census::enabled() ? census::now_ns() : 0;
-      scheduler::wait_for_one();
+      if (cap_hit) {
+        const uint64_t cap_t0 = census::enabled() ? census::now_ns() : 0;
+        scheduler::wait_for_one();
+        if (census::enabled()) {
+          census::note_wait("cap_wait", census::now_ns() - cap_t0);
+        }
+      } else {
+        const uint64_t memory_t0 = census::enabled() ? census::now_ns() : 0;
+        scheduler::wait_for_one();
+        if (census::enabled()) {
+          census::note_wait("memory_wait", census::now_ns() - memory_t0);
+        }
+      }
+      const uint64_t memory_t0 = census::enabled() ? census::now_ns() : 0;
+      bool waited_for_memory = false;
       while (get_active_memory() > get_memory_limit() &&
              scheduler::n_active_tasks() > 0) {
+        waited_for_memory = true;
         scheduler::wait_for_one();
       }
-      if (census::enabled() && cap_hit) {
-        census::note_wait("cap_wait", census::now_ns() - cap_t0);
+      if (census::enabled() && waited_for_memory) {
+        census::note_wait("memory_wait", census::now_ns() - memory_t0);
       }
     }
 

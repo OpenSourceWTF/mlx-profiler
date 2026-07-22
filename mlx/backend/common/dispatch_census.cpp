@@ -6,33 +6,39 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
+#include <deque>
 #include <fstream>
 #include <map>
 #if defined(__APPLE__)
 #include <mach/mach_time.h>
 #endif
 #include <mutex>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 
 namespace mlx::core::census {
 
 namespace detail {
 
-static bool init_enabled() {
+static std::string init_path() {
   const char* path = std::getenv("MLX_DISPATCH_CENSUS");
-  return path != nullptr && path[0] != '\0';
+  return path == nullptr ? std::string() : std::string(path);
 }
 
+const std::string& g_path = *new std::string(init_path());
 // Initialised at static-init, before any Metal command is encoded.
-bool g_enabled = init_enabled();
+bool g_enabled = !g_path.empty();
 
 } // namespace detail
 
 // Emit a "wait" event line only for stalls at least this long; shorter waits
 // still accumulate into the per-bucket totals but do not flood the JSONL.
 static constexpr uint64_t kWaitEmitFloorNs = 250;
+static constexpr const char* kSchemaPrefix = "{\"schema_version\":1,";
 
 int parse_max_active_tasks(const char* value) {
   if (value != nullptr && value[0] != '\0') {
@@ -62,11 +68,142 @@ uint64_t now_ns() {
 
 namespace {
 
-// ---- JSONL sink ----------------------------------------------------------
-std::mutex g_file_mtx;
-std::ofstream g_file;
-bool g_file_opened = false;
-bool g_file_failed = false;
+struct CbRecord {
+  uint64_t encode_start_ns = 0;
+  uint64_t encode_end_ns = 0;
+  uint64_t first_op_seq = 0;
+  uint64_t last_op_seq = 0;
+  uint64_t op_count = 0;
+};
+
+struct Bucket {
+  uint64_t count = 0;
+  uint64_t total_ns = 0;
+};
+
+struct QueuedLine {
+  uint64_t id;
+  std::string text;
+};
+
+// MLX intentionally leaks its scheduler and Metal device because their worker
+// threads and callbacks may still run during static destruction. Census state
+// follows the same process-lifetime rule so those producers never touch
+// destructed mutexes, maps, or streams.
+struct CensusState {
+  std::mutex file_mtx;
+  std::ofstream file;
+  bool file_opened = false;
+  std::once_flag file_init;
+  std::mutex queue_mtx;
+  std::condition_variable queue_cv;
+  std::condition_variable drained_cv;
+  std::deque<QueuedLine> lines;
+  uint64_t next_line_id = 0;
+  uint64_t written_line_id = 0;
+  bool writer_stop = false;
+  std::thread writer;
+
+  std::mutex name_mtx;
+  std::unordered_map<const void*, std::string> names;
+  std::atomic<uint64_t> seq{0};
+  std::atomic<uint64_t> cb_counter{0};
+  std::atomic<uint64_t> summary_counter{0};
+
+  std::mutex cb_mtx;
+  std::unordered_map<uint64_t, CbRecord> cb_records;
+
+  std::mutex bucket_mtx;
+  std::map<std::string, Bucket> buckets;
+
+  std::atomic<bool> closing{false};
+  std::atomic<uint64_t> active_producers{0};
+  std::mutex producer_mtx;
+  std::condition_variable producer_cv;
+};
+
+CensusState& global_state() {
+  static CensusState* state = new CensusState;
+  return *state;
+}
+
+void leave_producer(CensusState& state) {
+  if (state.active_producers.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+    std::lock_guard<std::mutex> lk(state.producer_mtx);
+    state.producer_cv.notify_all();
+  }
+}
+
+class ProducerGuard {
+ public:
+  ProducerGuard() {
+    if (!detail::g_enabled) {
+      return;
+    }
+    auto& state = global_state();
+    if (state.closing.load(std::memory_order_acquire)) {
+      return;
+    }
+    state.active_producers.fetch_add(1, std::memory_order_acq_rel);
+    if (state.closing.load(std::memory_order_acquire)) {
+      leave_producer(state);
+      return;
+    }
+    state_ = &state;
+  }
+
+  ~ProducerGuard() {
+    if (state_ != nullptr) {
+      leave_producer(*state_);
+    }
+  }
+
+  explicit operator bool() const {
+    return state_ != nullptr;
+  }
+
+  CensusState& state() const {
+    return *state_;
+  }
+
+ private:
+  CensusState* state_ = nullptr;
+};
+
+void writer_loop(CensusState& state) {
+  while (true) {
+    QueuedLine line;
+    {
+      std::unique_lock<std::mutex> lk(state.queue_mtx);
+      state.queue_cv.wait(
+          lk, [&state] { return state.writer_stop || !state.lines.empty(); });
+      if (state.lines.empty() && state.writer_stop) {
+        return;
+      }
+      line = std::move(state.lines.front());
+      state.lines.pop_front();
+    }
+    {
+      std::lock_guard<std::mutex> lk(state.file_mtx);
+      state.file << line.text;
+    }
+    {
+      std::lock_guard<std::mutex> lk(state.queue_mtx);
+      state.written_line_id = line.id;
+    }
+    state.drained_cv.notify_all();
+  }
+}
+
+void initialize_file(CensusState& state) {
+  state.file.open(detail::g_path, std::ios::out | std::ios::trunc);
+  state.file_opened = state.file.is_open();
+  if (!state.file_opened) {
+    throw std::runtime_error(
+        "MLX_DISPATCH_CENSUS cannot open output path: " + detail::g_path);
+  }
+  state.writer = std::thread([&state] { writer_loop(state); });
+}
 
 void append_json_string(std::string& out, const std::string& value) {
   out.push_back('"');
@@ -101,77 +238,61 @@ void append_json_string(std::string& out, const std::string& value) {
   out.push_back('"');
 }
 
-// Writes one complete JSONL line under the file mutex.
-void write_line(const std::string& line) {
-  std::lock_guard<std::mutex> lk(g_file_mtx);
-  if (!g_file_opened && !g_file_failed) {
-    const char* path = std::getenv("MLX_DISPATCH_CENSUS");
-    if (path != nullptr && path[0] != '\0') {
-      g_file.open(path, std::ios::out | std::ios::trunc);
-    }
-    g_file_opened = true;
-    g_file_failed = !g_file.is_open();
+// Queue one complete JSONL line. Only the dedicated writer touches the sink.
+uint64_t write_line(CensusState& state, std::string line) {
+  uint64_t id;
+  {
+    std::lock_guard<std::mutex> lk(state.queue_mtx);
+    id = ++state.next_line_id;
+    state.lines.push_back(QueuedLine{id, std::move(line)});
   }
-  if (!g_file_failed) {
-    g_file << line;
-  }
+  state.queue_cv.notify_one();
+  return id;
 }
 
-// ---- op / kernel-name state ----------------------------------------------
-std::mutex g_name_mtx;
-std::unordered_map<const void*, std::string> g_names;
-std::atomic<uint64_t> g_seq{0};
-std::atomic<uint64_t> g_cb_counter{0};
+void wait_until_written(CensusState& state, uint64_t line_id) {
+  std::unique_lock<std::mutex> lk(state.queue_mtx);
+  state.drained_cv.wait(
+      lk, [&state, line_id] { return state.written_line_id >= line_id; });
+}
 
-struct CbRecord {
-  uint64_t encode_start_ns = 0;
-  uint64_t encode_end_ns = 0;
-  uint64_t first_op_seq = 0;
-  uint64_t last_op_seq = 0;
-  uint64_t op_count = 0;
-};
-std::mutex g_cb_mtx;
-std::unordered_map<uint64_t, CbRecord> g_cb_records;
-
-// ---- wait / counter buckets ----------------------------------------------
-struct Bucket {
-  uint64_t count = 0;
-  uint64_t total_ns = 0;
-};
-std::mutex g_bucket_mtx;
-std::map<std::string, Bucket> g_buckets;
-
-std::string resolve_name(const void* pipeline) {
+std::string resolve_name(CensusState& state, const void* pipeline) {
   if (pipeline == nullptr) {
     return "<none>";
   }
-  std::lock_guard<std::mutex> lk(g_name_mtx);
-  auto it = g_names.find(pipeline);
-  return it == g_names.end() ? std::string("<unknown>") : it->second;
+  std::lock_guard<std::mutex> lk(state.name_mtx);
+  auto it = state.names.find(pipeline);
+  return it == state.names.end() ? std::string("<unknown>") : it->second;
 }
 
-void note_encode_begin(CommandBufferState& state) {
-  if (!state.started) {
-    state.started = true;
-    state.uid = g_cb_counter.fetch_add(1, std::memory_order_relaxed);
-    state.encode_start_ns = now_ns();
-    state.first_op_seq = 0;
-    state.last_op_seq = 0;
-    state.op_count = 0;
+void note_encode_begin(CensusState& global, CommandBufferState& encoder) {
+  if (!encoder.started) {
+    encoder.started = true;
+    encoder.uid = global.cb_counter.fetch_add(1, std::memory_order_relaxed);
+    encoder.encode_start_ns = now_ns();
+    encoder.first_op_seq = 0;
+    encoder.last_op_seq = 0;
+    encoder.op_count = 0;
   }
 }
 
 // Dump the accumulated bucket table as one summary line.
-void write_summary() {
-  std::string line = "{\"record\":\"summary\",\"ops_total\":";
-  line += std::to_string(g_seq.load(std::memory_order_relaxed));
+uint64_t write_summary(CensusState& state, bool final) {
+  std::string line = kSchemaPrefix;
+  line += "\"record\":\"summary\",\"summary_seq\":";
+  line += std::to_string(
+      state.summary_counter.fetch_add(1, std::memory_order_relaxed));
+  line += ",\"final\":";
+  line += final ? "true" : "false";
+  line += ",\"ops_total\":";
+  line += std::to_string(state.seq.load(std::memory_order_relaxed));
   line += ",\"cbs_total\":";
-  line += std::to_string(g_cb_counter.load(std::memory_order_relaxed));
+  line += std::to_string(state.cb_counter.load(std::memory_order_relaxed));
   line += ",\"buckets\":{";
   {
-    std::lock_guard<std::mutex> lk(g_bucket_mtx);
+    std::lock_guard<std::mutex> lk(state.bucket_mtx);
     bool first = true;
-    for (const auto& [name, b] : g_buckets) {
+    for (const auto& [name, b] : state.buckets) {
       if (!first) {
         line += ",";
       }
@@ -182,56 +303,97 @@ void write_summary() {
     }
   }
   line += "}}\n";
-  write_line(line);
+  return write_line(state, std::move(line));
 }
 
-// Flush the sink on process teardown so a run that ends without an explicit
-// synchronize still leaves a complete artifact (summary + flush).
+// Close the sink on process teardown without destroying callback-visible state.
+// This is a terminal snapshot; it deliberately does not force a GPU drain.
 struct Closer {
   ~Closer() {
-    if (detail::g_enabled) {
-      write_summary();
-    }
-    std::lock_guard<std::mutex> lk(g_file_mtx);
-    if (g_file_opened && !g_file_failed) {
-      g_file.flush();
-    }
+    finalize();
   }
 };
 Closer g_closer;
 
 } // namespace
 
-void register_kernel(const void* pipeline, const char* name) {
-  if (!detail::g_enabled || pipeline == nullptr || name == nullptr) {
-    return;
-  }
-  std::lock_guard<std::mutex> lk(g_name_mtx);
-  g_names.insert_or_assign(pipeline, std::string(name));
-}
-
-void note_pipeline(CommandBufferState& state, const void* pipeline) {
+void initialize() {
   if (!detail::g_enabled) {
     return;
   }
-  note_encode_begin(state);
+  auto& state = global_state();
+  if (state.closing.load(std::memory_order_acquire)) {
+    return;
+  }
+  std::call_once(state.file_init, [&state] { initialize_file(state); });
+}
+
+void finalize() {
+  if (!detail::g_enabled) {
+    return;
+  }
+  auto& state = global_state();
+  bool expected = false;
+  if (!state.closing.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel)) {
+    return;
+  }
+  {
+    std::unique_lock<std::mutex> lk(state.producer_mtx);
+    state.producer_cv.wait(lk, [&state] {
+      return state.active_producers.load(std::memory_order_acquire) == 0;
+    });
+  }
+  if (!state.file_opened) {
+    return;
+  }
+  const uint64_t final_line = write_summary(state, true);
+  wait_until_written(state, final_line);
+  {
+    std::lock_guard<std::mutex> lk(state.queue_mtx);
+    state.writer_stop = true;
+  }
+  state.queue_cv.notify_one();
+  state.writer.join();
+  std::lock_guard<std::mutex> lk(state.file_mtx);
+  state.file.flush();
+}
+
+void register_kernel(const void* pipeline, const char* name) {
+  ProducerGuard guard;
+  if (!guard || pipeline == nullptr || name == nullptr) {
+    return;
+  }
+  auto& global = guard.state();
+  std::lock_guard<std::mutex> lk(global.name_mtx);
+  global.names.insert_or_assign(pipeline, std::string(name));
+}
+
+void note_pipeline(CommandBufferState& state, const void* pipeline) {
+  ProducerGuard guard;
+  if (!guard) {
+    return;
+  }
+  note_encode_begin(guard.state(), state);
   state.pipeline = pipeline;
 }
 
 void note_set_bytes(CommandBufferState& state, std::size_t nbytes) {
-  if (!detail::g_enabled) {
+  ProducerGuard guard;
+  if (!guard) {
     return;
   }
-  note_encode_begin(state);
+  note_encode_begin(guard.state(), state);
   state.set_bytes_calls += 1;
   state.set_bytes_total_bytes += nbytes;
 }
 
 void note_buffer_bind(CommandBufferState& state) {
-  if (!detail::g_enabled) {
+  ProducerGuard guard;
+  if (!guard) {
     return;
   }
-  note_encode_begin(state);
+  note_encode_begin(guard.state(), state);
   state.buffer_binds += 1;
 }
 
@@ -240,24 +402,26 @@ void note_dispatch(
     const char* dispatch_kind,
     Dim3 grid,
     Dim3 threadgroup) {
-  if (!detail::g_enabled) {
+  ProducerGuard guard;
+  if (!guard) {
     return;
   }
+  auto& global = guard.state();
 
-  const uint64_t seq = g_seq.fetch_add(1, std::memory_order_relaxed);
+  const uint64_t seq = global.seq.fetch_add(1, std::memory_order_relaxed);
 
-  note_encode_begin(state);
+  note_encode_begin(global, state);
   if (state.op_count == 0) {
     state.first_op_seq = seq;
   }
   state.last_op_seq = seq;
   state.op_count += 1;
 
-  const std::string name = resolve_name(state.pipeline);
+  const std::string name = resolve_name(global, state.pipeline);
 
-  std::string line;
+  std::string line = kSchemaPrefix;
   line.reserve(288);
-  line += "{\"record\":\"op\",\"seq\":";
+  line += "\"record\":\"op\",\"seq\":";
   line += std::to_string(seq);
   line += ",\"command_buffer_index\":";
   line += std::to_string(state.uid);
@@ -278,7 +442,7 @@ void note_dispatch(
   line += std::to_string(threadgroup.x) + "," + std::to_string(threadgroup.y) +
       "," + std::to_string(threadgroup.z);
   line += "]}\n";
-  write_line(line);
+  write_line(global, std::move(line));
 
   // Reset per-command accumulators; the next command starts clean.
   state.set_bytes_calls = 0;
@@ -287,9 +451,11 @@ void note_dispatch(
 }
 
 uint64_t note_cb_encode_end(CommandBufferState& state) {
-  if (!detail::g_enabled) {
+  ProducerGuard guard;
+  if (!guard) {
     return 0;
   }
+  auto& global = guard.state();
   const uint64_t end_ns = now_ns();
   uint64_t uid;
   CbRecord rec;
@@ -301,7 +467,7 @@ uint64_t note_cb_encode_end(CommandBufferState& state) {
     rec.op_count = state.op_count;
   } else {
     // Committed with no ops encoded (e.g. an empty finalize).
-    uid = g_cb_counter.fetch_add(1, std::memory_order_relaxed);
+    uid = global.cb_counter.fetch_add(1, std::memory_order_relaxed);
     rec.encode_start_ns = end_ns;
     rec.first_op_seq = 0;
     rec.last_op_seq = 0;
@@ -309,8 +475,8 @@ uint64_t note_cb_encode_end(CommandBufferState& state) {
   }
   rec.encode_end_ns = end_ns;
   {
-    std::lock_guard<std::mutex> lk(g_cb_mtx);
-    g_cb_records[uid] = rec;
+    std::lock_guard<std::mutex> lk(global.cb_mtx);
+    global.cb_records[uid] = rec;
   }
   state.started = false; // next op opens a fresh command buffer
   return uid;
@@ -320,20 +486,23 @@ void note_cb_gpu_times(
     uint64_t cb_index,
     double gpu_start_ns,
     double gpu_end_ns) {
-  if (!detail::g_enabled) {
+  ProducerGuard guard;
+  if (!guard) {
     return;
   }
+  auto& global = guard.state();
   CbRecord rec;
   {
-    std::lock_guard<std::mutex> lk(g_cb_mtx);
-    auto it = g_cb_records.find(cb_index);
-    if (it == g_cb_records.end()) {
+    std::lock_guard<std::mutex> lk(global.cb_mtx);
+    auto it = global.cb_records.find(cb_index);
+    if (it == global.cb_records.end()) {
       return;
     }
     rec = it->second;
-    g_cb_records.erase(it);
+    global.cb_records.erase(it);
   }
-  std::string line = "{\"record\":\"cb\",\"command_buffer_index\":";
+  std::string line = kSchemaPrefix;
+  line += "\"record\":\"cb\",\"command_buffer_index\":";
   line += std::to_string(cb_index);
   line += ",\"op_count\":" + std::to_string(rec.op_count);
   line += ",\"first_op_seq\":" + std::to_string(rec.first_op_seq);
@@ -346,36 +515,44 @@ void note_cb_gpu_times(
   line += ",\"gpu_end_ns\":" +
       std::to_string(static_cast<uint64_t>(gpu_end_ns < 0 ? 0 : gpu_end_ns));
   line += "}\n";
-  write_line(line);
+  write_line(global, std::move(line));
 }
 
 void note_wait(const char* bucket, uint64_t wait_ns) {
-  if (!detail::g_enabled) {
+  ProducerGuard guard;
+  if (!guard) {
     return;
   }
+  auto& global = guard.state();
   const std::string name = bucket ? bucket : "";
   {
-    std::lock_guard<std::mutex> lk(g_bucket_mtx);
-    auto& b = g_buckets[name];
+    std::lock_guard<std::mutex> lk(global.bucket_mtx);
+    auto& b = global.buckets[name];
     b.count += 1;
     b.total_ns += wait_ns;
   }
   if (wait_ns < kWaitEmitFloorNs) {
     return;
   }
-  std::string line = "{\"record\":\"wait\",\"bucket\":";
+  std::string line = kSchemaPrefix;
+  line += "\"record\":\"wait\",\"bucket\":";
   append_json_string(line, name);
   line += ",\"wait_ns\":" + std::to_string(wait_ns);
   line += ",\"at_ns\":" + std::to_string(now_ns());
   line += "}\n";
-  write_line(line);
+  write_line(global, std::move(line));
 }
 
 void flush() {
-  std::lock_guard<std::mutex> lk(g_file_mtx);
-  if (g_file_opened && !g_file_failed) {
-    g_file.flush();
+  ProducerGuard guard;
+  if (!guard) {
+    return;
   }
+  auto& state = guard.state();
+  const uint64_t summary_line = write_summary(state, false);
+  wait_until_written(state, summary_line);
+  std::lock_guard<std::mutex> lk(state.file_mtx);
+  state.file.flush();
 }
 
 } // namespace mlx::core::census
