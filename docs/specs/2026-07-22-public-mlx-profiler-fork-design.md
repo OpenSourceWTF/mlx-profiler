@@ -1,6 +1,6 @@
 # Public MLX Profiler Fork Design
 
-**Status:** Approved approach; awaiting written-spec review  
+**Status:** Approved
 **Date:** 2026-07-22
 
 ## Goal
