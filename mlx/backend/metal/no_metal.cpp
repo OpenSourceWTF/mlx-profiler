@@ -51,6 +51,24 @@ size_t CaptureReplay::num_barriers() const {
 size_t CaptureReplay::largest_barrier_free_run() const {
   return 0;
 }
+size_t CaptureReplay::num_raw_barriers() const {
+  return 0;
+}
+size_t CaptureReplay::num_waw_barriers() const {
+  return 0;
+}
+size_t CaptureReplay::max_buffer_write_count() const {
+  return 0;
+}
+size_t CaptureReplay::hottest_barrier_buffer_barriers() const {
+  return 0;
+}
+size_t CaptureReplay::renamable_writes() const {
+  return 0;
+}
+size_t CaptureReplay::renamed_writes() const {
+  return 0;
+}
 const std::vector<array>& CaptureReplay::inputs() const {
   static std::vector<array> empty;
   return empty;

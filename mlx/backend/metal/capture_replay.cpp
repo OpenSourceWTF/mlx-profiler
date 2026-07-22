@@ -308,6 +308,24 @@ struct CaptureReplay::Impl {
   // (the alpha behaviour / a fully dependent chain like the toy).
   size_t num_barriers = 0;
   size_t largest_barrier_free_run = 0;
+  // Barrier-cause diagnostics — decide reuse (renamable, fix a) vs a genuine
+  // per-layer chain (fix b). raw = a barrier a read triggered; waw = a barrier a
+  // write triggered. max_buffer_write_count = writes to the single hottest
+  // buffer (a shared scratch written by every layer shows up here).
+  // hottest_barrier_buffer_barriers = how many barriers the single worst
+  // offending buffer triggered. renamable_writes = full-def writes that reuse a
+  // previously-written buffer and could be renamed to break a false chain;
+  // renamed_writes = how many were actually renamed (0 unless rename enabled).
+  size_t num_raw_barriers = 0;
+  size_t num_waw_barriers = 0;
+  size_t max_buffer_write_count = 0;
+  size_t hottest_barrier_buffer_barriers = 0;
+  size_t renamable_writes = 0;
+  size_t renamed_writes = 0;
+
+  // Renaming duplicates (fix a, gated by MLX_CAPTURE_REPLAY_RENAME). Owned here;
+  // made resident on replay via useResources alongside the arena.
+  std::vector<NS::SharedPtr<MTL::Buffer>> rename_dupes;
 
   // Distinct pinned buffers (arena) — used for useResources and, at teardown,
   // for the deferred allocator free.
@@ -366,6 +384,30 @@ size_t CaptureReplay::num_barriers() const {
 
 size_t CaptureReplay::largest_barrier_free_run() const {
   return impl_->largest_barrier_free_run;
+}
+
+size_t CaptureReplay::num_raw_barriers() const {
+  return impl_->num_raw_barriers;
+}
+
+size_t CaptureReplay::num_waw_barriers() const {
+  return impl_->num_waw_barriers;
+}
+
+size_t CaptureReplay::max_buffer_write_count() const {
+  return impl_->max_buffer_write_count;
+}
+
+size_t CaptureReplay::hottest_barrier_buffer_barriers() const {
+  return impl_->hottest_barrier_buffer_barriers;
+}
+
+size_t CaptureReplay::renamable_writes() const {
+  return impl_->renamable_writes;
+}
+
+size_t CaptureReplay::renamed_writes() const {
+  return impl_->renamed_writes;
 }
 
 const std::vector<array>& CaptureReplay::inputs() const {
@@ -578,27 +620,118 @@ std::shared_ptr<CaptureReplay> CaptureReplay::capture(
 
   // Deferred barrier pruning (replaces the alpha's per-command barrier). The
   // alpha put setBarrier() on every command, fully serializing the stream on the
-  // GPU — the real A3B graph's many small kernels pay heavily for that. Instead
-  // we set a barrier ONLY where a true hazard exists: a command that touches a
-  // buffer WRITTEN by any command since the previous barrier. A barrier makes
-  // all prior commands complete before this one, so it clears the accumulated
-  // write set; independent commands between barriers run concurrently.
+  // GPU. We set a barrier ONLY where a true hazard exists: a command that
+  // touches a buffer WRITTEN by any command since the previous barrier. A
+  // barrier makes all prior commands complete before it, so it clears the
+  // accumulated write set; independent commands between barriers run
+  // concurrently. A pruning miss surfaces as a bitwise mismatch in the bench.
   //
-  // Rule (conservative RAW/WAW; WAR is a non-issue here because inputs are held
-  // non-donatable and every intermediate has a single writer that precedes its
-  // reads, so a written buffer is always already in W): for command i, if any
-  // bound buffer (read set) or written buffer is in W -> barrier, reset W, then
-  // W |= writes_i; else W |= writes_i. A pruning miss would surface as a bitwise
-  // mismatch in the bench (the safety net), never a silent wrong answer.
+  // Optional renaming (fix a, env MLX_CAPTURE_REPLAY_RENAME): a WAW hazard on a
+  // physical buffer that an independent later command FULLY overwrites (donation
+  // reuse across independent ops) is a false chain — the buffers are logically
+  // distinct. We break it by giving that write its own duplicate buffer and
+  // rebinding subsequent reads of that version, converting the false chain into
+  // real independence. Conservative triggers only (never an input/output buffer,
+  // only a bound-ONCE write that reuses a previously-written buffer), so in-place
+  // RMW (bound twice) keeps its true ordering. CAVEAT: a bound-once write that
+  // covers only PART of a reused buffer (e.g. per-slice concat copies into one
+  // output) would be wrongly renamed — hence rename is EXPERIMENTAL and gated:
+  // the bench's bitwise gates verify every rename, and it is default OFF (the
+  // pruned-only path is already GPU-validated). Diagnostics below quantify how
+  // many barriers renaming WOULD remove even when it is off.
+  const bool rename_enabled = [] {
+    const char* v = std::getenv("MLX_CAPTURE_REPLAY_RENAME");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+
+  // Output/input buffer sets — never renamed (keeps copy-out + replay writes
+  // targeting the buffers the caller reads / rewrites).
+  std::unordered_set<const MTL::Buffer*> output_bufs;
+  for (auto& o : outputs) {
+    output_bufs.insert(static_cast<const MTL::Buffer*>(o.buffer().ptr()));
+  }
+
+  // Effective (post-rename) binds and write set per dispatch. Identity when
+  // rename is off. cur maps an original buffer to its current live version.
+  std::vector<std::vector<capture::BufferBind>> eff_binds(dispatches.size());
+  std::vector<std::vector<const MTL::Buffer*>> eff_writes(dispatches.size());
+  std::unordered_map<const MTL::Buffer*, const MTL::Buffer*> cur;
+  std::unordered_set<const MTL::Buffer*> written_before;
+  std::unordered_map<const MTL::Buffer*, size_t> write_freq;
+  size_t renamable = 0;
+  size_t renamed = 0;
+
+  auto current_of = [&cur](const MTL::Buffer* b) -> const MTL::Buffer* {
+    auto it = cur.find(b);
+    return it == cur.end() ? b : it->second;
+  };
+
+  for (size_t i = 0; i < dispatches.size(); ++i) {
+    auto& disp = dispatches[i];
+    // Count bind occurrences to detect bound-once (pure) writes vs RMW.
+    std::unordered_map<const MTL::Buffer*, int> occ;
+    for (auto& bb : disp.buffers) {
+      occ[bb.buf]++;
+    }
+    // Decide renames for this dispatch's writes.
+    std::unordered_map<const MTL::Buffer*, const MTL::Buffer*> renamed_here;
+    for (auto* wb : disp.write_bufs) {
+      write_freq[wb]++;
+      const bool reuse = written_before.count(wb) != 0;
+      const bool pure_write = occ[wb] == 1; // bound once -> not RMW
+      const bool safe = pure_write && output_bufs.find(wb) == output_bufs.end();
+      if (reuse && safe) {
+        ++renamable;
+        if (rename_enabled) {
+          auto dup = NS::TransferPtr(mtl_device->newBuffer(
+              wb->length(), MTL::ResourceStorageModeShared));
+          if (dup) {
+            renamed_here[wb] = dup.get();
+            cur[wb] = dup.get();
+            impl->rename_dupes.push_back(dup);
+            ++renamed;
+          }
+        }
+      }
+    }
+    // Build effective binds: a written buffer takes its renamed version (if
+    // any); every other bind takes the current live version.
+    eff_binds[i].reserve(disp.buffers.size());
+    for (auto& bb : disp.buffers) {
+      const MTL::Buffer* eff = bb.buf;
+      auto rit = renamed_here.find(bb.buf);
+      if (rit != renamed_here.end()) {
+        eff = rit->second;
+      } else {
+        eff = current_of(bb.buf);
+      }
+      eff_binds[i].push_back(capture::BufferBind{eff, bb.offset, bb.index});
+    }
+    eff_writes[i].reserve(disp.write_bufs.size());
+    for (auto* wb : disp.write_bufs) {
+      eff_writes[i].push_back(current_of(wb));
+    }
+    for (auto* wb : disp.write_bufs) {
+      written_before.insert(wb);
+    }
+  }
+  for (auto& kv : write_freq) {
+    impl->max_buffer_write_count =
+        std::max(impl->max_buffer_write_count, kv.second);
+  }
+
   std::unordered_set<const MTL::Buffer*> write_window;
+  std::unordered_map<const MTL::Buffer*, size_t> barrier_cause;
   size_t barrier_count = 0;
+  size_t raw_barriers = 0;
+  size_t waw_barriers = 0;
   size_t current_run = 0;
   size_t largest_run = 0;
   for (size_t i = 0; i < dispatches.size(); ++i) {
     auto& disp = dispatches[i];
     auto* cmd = impl->icb->indirectComputeCommand(i);
     cmd->setComputePipelineState(icb_of[disp.pipeline]);
-    for (auto& bb : disp.buffers) {
+    for (auto& bb : eff_binds[i]) {
       cmd->setKernelBuffer(bb.buf, bb.offset, bb.index);
     }
     for (size_t j = 0; j < disp.bytes.size(); ++j) {
@@ -614,38 +747,55 @@ std::shared_ptr<CaptureReplay> CaptureReplay::capture(
       cmd->concurrentDispatchThreadgroups(disp.grid, disp.group);
     }
 
-    bool hazard = false;
+    bool read_hazard = false;
+    bool write_hazard = false;
+    const MTL::Buffer* cause = nullptr;
     if (!write_window.empty()) {
-      for (auto& bb : disp.buffers) { // read set = every bound buffer
+      for (auto& bb : eff_binds[i]) { // read set = every bound buffer
         if (write_window.count(bb.buf)) {
-          hazard = true;
+          read_hazard = true;
+          cause = bb.buf;
           break;
         }
       }
-      if (!hazard) {
-        for (auto* wb : disp.write_bufs) { // WAW against the write window
+      if (!read_hazard) {
+        for (auto* wb : eff_writes[i]) { // WAW against the write window
           if (write_window.count(wb)) {
-            hazard = true;
+            write_hazard = true;
+            cause = wb;
             break;
           }
         }
       }
     }
-    if (hazard) {
+    if (read_hazard || write_hazard) {
       cmd->setBarrier();
       ++barrier_count;
+      raw_barriers += read_hazard ? 1 : 0;
+      waw_barriers += write_hazard ? 1 : 0;
+      if (cause) {
+        barrier_cause[cause]++;
+      }
       write_window.clear();
       largest_run = std::max(largest_run, current_run);
       current_run = 0;
     }
     ++current_run;
-    for (auto* wb : disp.write_bufs) {
+    for (auto* wb : eff_writes[i]) {
       write_window.insert(wb);
     }
   }
   largest_run = std::max(largest_run, current_run);
+  for (auto& kv : barrier_cause) {
+    impl->hottest_barrier_buffer_barriers =
+        std::max(impl->hottest_barrier_buffer_barriers, kv.second);
+  }
   impl->num_barriers = barrier_count;
   impl->largest_barrier_free_run = largest_run;
+  impl->num_raw_barriers = raw_barriers;
+  impl->num_waw_barriers = waw_barriers;
+  impl->renamable_writes = renamable;
+  impl->renamed_writes = renamed;
 
   // 4. Dedicated command queue for replay submission.
   impl->queue = NS::TransferPtr(mtl_device->newCommandQueue());
@@ -710,6 +860,12 @@ std::vector<array> CaptureReplay::replay(const std::vector<array>& new_inputs) {
   // residency set here); useHeap makes every allocation on that heap resident.
   for (auto* h : impl.heaps) {
     enc->useHeap(h);
+  }
+  // Rename duplicates (fix a) are device buffers outside the arena; make them
+  // resident too. Empty unless MLX_CAPTURE_REPLAY_RENAME was set at capture.
+  for (auto& dup : impl.rename_dupes) {
+    enc->useResource(
+        dup.get(), MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
   }
   enc->useResource(
       impl.packed_args.get(), MTL::ResourceUsageRead);

@@ -135,6 +135,30 @@ void init_metal(nb::module_& m) {
           &mx::metal::CaptureReplay::largest_barrier_free_run,
           "Longest run of consecutive barrier-free (concurrent) commands.")
       .def_prop_ro(
+          "num_raw_barriers",
+          &mx::metal::CaptureReplay::num_raw_barriers,
+          "Barriers triggered by a read-after-write hazard.")
+      .def_prop_ro(
+          "num_waw_barriers",
+          &mx::metal::CaptureReplay::num_waw_barriers,
+          "Barriers triggered by a write-after-write hazard.")
+      .def_prop_ro(
+          "max_buffer_write_count",
+          &mx::metal::CaptureReplay::max_buffer_write_count,
+          "Writes to the single hottest buffer (a shared scratch shows here).")
+      .def_prop_ro(
+          "hottest_barrier_buffer_barriers",
+          &mx::metal::CaptureReplay::hottest_barrier_buffer_barriers,
+          "Barriers caused by the single worst-offending buffer.")
+      .def_prop_ro(
+          "renamable_writes",
+          &mx::metal::CaptureReplay::renamable_writes,
+          "Full-def reuse writes that renaming could break into independence.")
+      .def_prop_ro(
+          "renamed_writes",
+          &mx::metal::CaptureReplay::renamed_writes,
+          "Writes actually renamed (0 unless MLX_CAPTURE_REPLAY_RENAME set).")
+      .def_prop_ro(
           "inputs",
           &mx::metal::CaptureReplay::inputs,
           "The captured input arrays (pinned buffers).")

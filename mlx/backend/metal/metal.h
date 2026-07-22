@@ -81,6 +81,14 @@ class MLX_API CaptureReplay {
   /** Longest run of consecutive barrier-free (concurrent) commands. */
   size_t largest_barrier_free_run() const;
 
+  /** Barrier-cause diagnostics (decide reuse vs a genuine per-layer chain). */
+  size_t num_raw_barriers() const; // barriers a read-after-write triggered
+  size_t num_waw_barriers() const; // barriers a write-after-write triggered
+  size_t max_buffer_write_count() const; // writes to the single hottest buffer
+  size_t hottest_barrier_buffer_barriers() const; // barriers the worst buffer caused
+  size_t renamable_writes() const; // full-def reuse writes that could be renamed
+  size_t renamed_writes() const; // actually renamed (0 unless rename enabled)
+
   /** The captured input / output arrays (pinned buffers). */
   const std::vector<array>& inputs() const;
   const std::vector<array>& outputs() const;
