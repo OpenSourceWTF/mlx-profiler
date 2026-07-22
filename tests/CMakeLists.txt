@@ -42,3 +42,16 @@ target_link_options(tests PRIVATE ${SANITIZER_LINK_FLAGS})
 
 doctest_discover_tests(tests)
 add_test(NAME tests COMMAND tests)
+
+add_executable(dispatch_census_smoke dispatch_census_smoke.cpp)
+target_link_libraries(dispatch_census_smoke PRIVATE mlx)
+set(CENSUS_ON ${CMAKE_CURRENT_BINARY_DIR}/dispatch-census-enabled.jsonl)
+set(CENSUS_OFF ${CMAKE_CURRENT_BINARY_DIR}/dispatch-census-disabled.jsonl)
+add_test(
+  NAME dispatch_census_disabled
+  COMMAND ${CMAKE_COMMAND} -E env --unset=MLX_DISPATCH_CENSUS
+          $<TARGET_FILE:dispatch_census_smoke> disabled ${CENSUS_OFF})
+add_test(
+  NAME dispatch_census_enabled
+  COMMAND ${CMAKE_COMMAND} -E env MLX_DISPATCH_CENSUS=${CENSUS_ON}
+          $<TARGET_FILE:dispatch_census_smoke> enabled ${CENSUS_ON})
