@@ -359,11 +359,19 @@ struct CaptureReplay::Impl {
   std::vector<MTL::Heap*> heaps;
 
   // Captured graph leaves / results. inputs are rewritten on replay; outputs
-  // are copied out. input_bufs mirrors the input buffers for the
-  // address-stability assert.
+  // are copied out. input_bufs / output_bufs mirror the leaf buffers for the
+  // address-stability asserts (output_bufs guards a feedback plan's blit
+  // sources, input_bufs its destinations and every rewritten input).
   std::vector<array> inputs;
   std::vector<array> outputs;
   std::vector<const MTL::Buffer*> input_bufs;
+  std::vector<const MTL::Buffer*> output_bufs;
+
+  // Persistent fence ordering a feedback plan's blit encoder after the ICB
+  // compute encoder inside one command buffer (MLX buffers are hazard-untracked,
+  // so the encoder boundary alone does NOT order them — see FeedbackPlan). Reused
+  // across cycles; safe only because feedback submits are serial (one in flight).
+  NS::SharedPtr<MTL::Fence> feedback_fence;
 
   ~Impl() {
     // Drain any submitted-but-unwaited command buffers before touching the
@@ -375,6 +383,7 @@ struct CaptureReplay::Impl {
     }
     inflight.clear();
     // Drop MTL objects first.
+    feedback_fence.reset();
     residency.reset();
     icb.reset();
     packed_args.reset();
@@ -390,6 +399,7 @@ struct CaptureReplay::Impl {
     inputs.clear();
     outputs.clear();
     input_bufs.clear();
+    output_bufs.clear();
     auto& alloc = metal::allocator();
     for (auto* b : arena) {
       alloc.unpin(b);
@@ -878,47 +888,76 @@ std::shared_ptr<CaptureReplay> CaptureReplay::capture(
     impl->input_bufs.push_back(
         static_cast<const MTL::Buffer*>(in.buffer().ptr()));
   }
+  impl->output_bufs.reserve(outputs.size());
+  for (auto& out : outputs) {
+    impl->output_bufs.push_back(
+        static_cast<const MTL::Buffer*>(out.buffer().ptr()));
+  }
+
+  // Fence for the device-side feedback path (S3). Created eagerly so the timed
+  // per-cycle submit never pays a fence allocation; unused unless a feedback
+  // plan is passed to a submit. newFence is cheap and never fails on Metal3.
+  impl->feedback_fence = NS::TransferPtr(mtl_device->newFence());
 
   return std::shared_ptr<CaptureReplay>(new CaptureReplay(std::move(impl)));
 }
 
-uint64_t CaptureReplay::replay_submit(const std::vector<array>& new_inputs) {
-  auto& impl = *impl_;
-  if (new_inputs.size() != impl.inputs.size()) {
+namespace {
+
+// Write one new input value into its pinned buffer: assert the captured buffer
+// has not moved (allocator reuse), eval the new value, size-check, memcpy.
+// NOTE: at pipeline depth > 1 these writes can race a prior in-flight replay's
+// GPU reads of the same pinned input buffers; the bench uses same-value inputs
+// (byte-identical writes are race-free) for pipelined timing and proves
+// fresh-value correctness unpipelined. Feedback chaining is serial, so the
+// per-cycle partial rewrite never races the previous cycle's reads.
+void write_input_leaf(CaptureReplay::Impl& impl, size_t i, array ni) {
+  auto* cur = static_cast<const MTL::Buffer*>(impl.inputs[i].buffer().ptr());
+  if (cur != impl.input_bufs[i]) {
+    throw std::runtime_error(
+        "[CaptureReplay] Captured input buffer " + std::to_string(i) +
+        " moved — the arena is no longer address-stable (allocator reuse).");
+  }
+  ni.eval();
+  if (ni.nbytes() != impl.inputs[i].nbytes()) {
     throw std::invalid_argument(
-        "[CaptureReplay::replay_submit] Expected " +
-        std::to_string(impl.inputs.size()) + " inputs, got " +
-        std::to_string(new_inputs.size()) + ".");
+        "[CaptureReplay] Input " + std::to_string(i) +
+        " size mismatch vs capture.");
   }
-  std::lock_guard<std::mutex> lk(impl.submit_mtx);
-  auto pool = metal::new_scoped_memory_pool();
+  std::memcpy(impl.inputs[i].data<char>(), ni.data<const char>(), ni.nbytes());
+}
 
-  // (a) Address-stability assert + (b) write new values into pinned inputs.
-  // NOTE: at pipeline depth > 1 these writes can race a prior in-flight replay's
-  // GPU reads of the same pinned input buffers; the bench uses same-value inputs
-  // (byte-identical writes are race-free) for pipelined timing and proves
-  // fresh-value correctness unpipelined. Documented in the bench.
-  for (size_t i = 0; i < new_inputs.size(); ++i) {
-    auto* cur = static_cast<const MTL::Buffer*>(impl.inputs[i].buffer().ptr());
-    if (cur != impl.input_bufs[i]) {
-      throw std::runtime_error(
-          "[CaptureReplay::replay_submit] Captured input buffer moved — the "
-          "arena is no longer address-stable (allocator reuse).");
+// Encode ONE command buffer that executes the ICB (optionally followed by a
+// fenced feedback-blit pass) and commit WITHOUT waiting. Assumes impl.submit_mtx
+// is held and the pinned inputs are already written. Returns the ticket.
+uint64_t encode_and_commit(
+    CaptureReplay::Impl& impl,
+    const CaptureReplay::FeedbackPlan* plan) {
+  const bool has_feedback = plan != nullptr && !plan->blits.empty();
+
+  // Pre-validate feedback buffer stability BEFORE touching the queue, so a moved
+  // arena fails cleanly with nothing half-encoded.
+  if (has_feedback) {
+    for (auto& b : plan->blits) {
+      auto* src =
+          static_cast<const MTL::Buffer*>(impl.outputs[b.out_index].buffer().ptr());
+      auto* dst =
+          static_cast<const MTL::Buffer*>(impl.inputs[b.in_index].buffer().ptr());
+      if (src != impl.output_bufs[b.out_index] ||
+          dst != impl.input_bufs[b.in_index]) {
+        throw std::runtime_error(
+            "[CaptureReplay::replay_submit] Feedback plan buffer moved — the "
+            "arena is no longer address-stable (allocator reuse).");
+      }
     }
-    array ni = new_inputs[i];
-    ni.eval();
-    if (ni.nbytes() != impl.inputs[i].nbytes()) {
-      throw std::invalid_argument(
-          "[CaptureReplay::replay_submit] Input " + std::to_string(i) +
-          " size mismatch vs capture.");
-    }
-    std::memcpy(
-        impl.inputs[i].data<char>(), ni.data<const char>(), ni.nbytes());
   }
 
-  // (c) Encode ONE command buffer and commit WITHOUT waiting. When the
-  // persistent residency set is active the per-call residency declaration is
-  // skipped (the amortization); otherwise fall back to per-call residency.
+  // When the persistent residency set is active the per-call residency
+  // declaration is skipped (the amortization); otherwise fall back to per-call
+  // residency on the compute encoder. A feedback blit names its src/dst
+  // directly, so it is covered by the queue residency set when active and by
+  // Metal's automatic residency for directly-referenced resources otherwise
+  // (unlike the ICB, whose commands are opaque and need explicit useResources).
   auto* cb = impl.queue->commandBuffer();
   auto* enc = cb->computeCommandEncoder(MTL::DispatchTypeConcurrent);
   if (!impl.use_residency) {
@@ -938,12 +977,115 @@ uint64_t CaptureReplay::replay_submit(const std::vector<array>& new_inputs) {
     enc->useResource(impl.packed_args.get(), MTL::ResourceUsageRead);
   }
   enc->executeCommandsInBuffer(impl.icb.get(), NS::Range(0, impl.num_commands));
+  // Fence the ICB compute encoder so the feedback blit observes its completed
+  // outputs — MLX buffers are hazard-untracked, so the encoder boundary alone
+  // does NOT order the blit after the compute pass (see FeedbackPlan in
+  // metal.h). This mirrors MLX's own cross-encoder fence discipline.
+  if (has_feedback) {
+    enc->updateFence(impl.feedback_fence.get());
+  }
   enc->endEncoding();
+
+  if (has_feedback) {
+    auto* blit = cb->blitCommandEncoder();
+    blit->waitForFence(impl.feedback_fence.get());
+    for (auto& b : plan->blits) {
+      auto* src =
+          static_cast<const MTL::Buffer*>(impl.outputs[b.out_index].buffer().ptr());
+      auto* dst =
+          static_cast<const MTL::Buffer*>(impl.inputs[b.in_index].buffer().ptr());
+      blit->copyFromBuffer(src, 0, dst, 0, b.nbytes);
+    }
+    blit->endEncoding();
+  }
   cb->commit();
 
   uint64_t ticket = impl.next_ticket++;
   impl.inflight.emplace(ticket, NS::RetainPtr(cb));
   return ticket;
+}
+
+} // namespace
+
+std::shared_ptr<CaptureReplay::FeedbackPlan> CaptureReplay::make_feedback_plan(
+    const std::vector<std::pair<size_t, size_t>>& pairs) const {
+  auto& impl = *impl_;
+  auto plan = std::make_shared<FeedbackPlan>();
+  plan->blits.reserve(pairs.size());
+  for (auto& pr : pairs) {
+    size_t out_idx = pr.first;
+    size_t in_idx = pr.second;
+    if (out_idx >= impl.outputs.size()) {
+      throw std::out_of_range(
+          "[CaptureReplay::make_feedback_plan] output index " +
+          std::to_string(out_idx) + " out of range (" +
+          std::to_string(impl.outputs.size()) + " outputs).");
+    }
+    if (in_idx >= impl.inputs.size()) {
+      throw std::out_of_range(
+          "[CaptureReplay::make_feedback_plan] input index " +
+          std::to_string(in_idx) + " out of range (" +
+          std::to_string(impl.inputs.size()) + " inputs).");
+    }
+    size_t out_bytes = impl.outputs[out_idx].nbytes();
+    size_t in_bytes = impl.inputs[in_idx].nbytes();
+    if (out_bytes != in_bytes) {
+      throw std::invalid_argument(
+          "[CaptureReplay::make_feedback_plan] byte-size mismatch for pair (out " +
+          std::to_string(out_idx) + " = " + std::to_string(out_bytes) +
+          " B, in " + std::to_string(in_idx) + " = " + std::to_string(in_bytes) +
+          " B). A feedback blit requires equal-size leaves.");
+    }
+    plan->blits.push_back(FeedbackPlan::Blit{out_idx, in_idx, out_bytes});
+  }
+  return plan;
+}
+
+uint64_t CaptureReplay::replay_submit(
+    const std::vector<array>& new_inputs,
+    const std::shared_ptr<FeedbackPlan>& feedback_plan) {
+  auto& impl = *impl_;
+  if (new_inputs.size() != impl.inputs.size()) {
+    throw std::invalid_argument(
+        "[CaptureReplay::replay_submit] Expected " +
+        std::to_string(impl.inputs.size()) + " inputs, got " +
+        std::to_string(new_inputs.size()) + ".");
+  }
+  std::lock_guard<std::mutex> lk(impl.submit_mtx);
+  auto pool = metal::new_scoped_memory_pool();
+  for (size_t i = 0; i < new_inputs.size(); ++i) {
+    write_input_leaf(impl, i, new_inputs[i]);
+  }
+  return encode_and_commit(impl, feedback_plan.get());
+}
+
+uint64_t CaptureReplay::replay_submit_partial(
+    const std::vector<size_t>& indices,
+    const std::vector<array>& arrays,
+    const std::shared_ptr<FeedbackPlan>& feedback_plan) {
+  auto& impl = *impl_;
+  if (indices.size() != arrays.size()) {
+    throw std::invalid_argument(
+        "[CaptureReplay::replay_submit_partial] indices and arrays length "
+        "mismatch (" +
+        std::to_string(indices.size()) + " vs " +
+        std::to_string(arrays.size()) + ").");
+  }
+  std::lock_guard<std::mutex> lk(impl.submit_mtx);
+  auto pool = metal::new_scoped_memory_pool();
+  // Rewrite ONLY the named leaves; all other pinned inputs persist untouched
+  // (the previous submit / feedback blit's contents).
+  for (size_t k = 0; k < indices.size(); ++k) {
+    size_t i = indices[k];
+    if (i >= impl.inputs.size()) {
+      throw std::out_of_range(
+          "[CaptureReplay::replay_submit_partial] input leaf index " +
+          std::to_string(i) + " out of range (" +
+          std::to_string(impl.inputs.size()) + " leaves).");
+    }
+    write_input_leaf(impl, i, arrays[k]);
+  }
+  return encode_and_commit(impl, feedback_plan.get());
 }
 
 void CaptureReplay::replay_wait(uint64_t ticket) {
@@ -986,6 +1128,44 @@ std::vector<array> CaptureReplay::read_outputs() {
         mem, out.shape(), out.dtype(), [](void* p) { std::free(p); });
   }
   return results;
+}
+
+array CaptureReplay::read_output(size_t index) {
+  auto& impl = *impl_;
+  if (index >= impl.outputs.size()) {
+    throw std::out_of_range(
+        "[CaptureReplay::read_output] output index " + std::to_string(index) +
+        " out of range (" + std::to_string(impl.outputs.size()) + " outputs).");
+  }
+  auto& out = impl.outputs[index];
+  size_t nbytes = out.nbytes();
+  void* mem = std::malloc(std::max<size_t>(nbytes, 1));
+  std::memcpy(mem, out.data<const char>(), nbytes);
+  return array(mem, out.shape(), out.dtype(), [](void* p) { std::free(p); });
+}
+
+std::vector<array> CaptureReplay::output_arrays(
+    const std::vector<size_t>& indices) const {
+  auto& impl = *impl_;
+  std::vector<array> views;
+  views.reserve(indices.size());
+  for (size_t idx : indices) {
+    if (idx >= impl.outputs.size()) {
+      throw std::out_of_range(
+          "[CaptureReplay::output_arrays] output index " +
+          std::to_string(idx) + " out of range (" +
+          std::to_string(impl.outputs.size()) + " outputs).");
+    }
+    // Zero-copy: the captured output array already wraps the pinned P_out
+    // buffer; sharing its array_desc aliases that buffer in place. Valid only
+    // until the next replay submit overwrites it (see the header's aliasing
+    // contract). The buffer stays pinned, so it is never recycled while a view
+    // is outstanding; at handle teardown a still-held view keeps the buffer
+    // alive (unpin is a no-op for a still-owned pinned buffer) and frees it
+    // when the last view drops.
+    views.push_back(impl.outputs[idx]);
+  }
+  return views;
 }
 
 bool CaptureReplay::residency_set_active() const {

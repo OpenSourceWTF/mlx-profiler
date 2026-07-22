@@ -42,14 +42,35 @@ CaptureReplay::~CaptureReplay() = default;
 std::vector<array> CaptureReplay::replay(const std::vector<array>&) {
   throw std::runtime_error("[CaptureReplay::replay] No Metal back-end.");
 }
-uint64_t CaptureReplay::replay_submit(const std::vector<array>&) {
+std::shared_ptr<CaptureReplay::FeedbackPlan> CaptureReplay::make_feedback_plan(
+    const std::vector<std::pair<size_t, size_t>>&) const {
+  throw std::runtime_error(
+      "[CaptureReplay::make_feedback_plan] No Metal back-end.");
+}
+uint64_t CaptureReplay::replay_submit(
+    const std::vector<array>&,
+    const std::shared_ptr<FeedbackPlan>&) {
   throw std::runtime_error("[CaptureReplay::replay_submit] No Metal back-end.");
+}
+uint64_t CaptureReplay::replay_submit_partial(
+    const std::vector<size_t>&,
+    const std::vector<array>&,
+    const std::shared_ptr<FeedbackPlan>&) {
+  throw std::runtime_error(
+      "[CaptureReplay::replay_submit_partial] No Metal back-end.");
 }
 void CaptureReplay::replay_wait(uint64_t) {
   throw std::runtime_error("[CaptureReplay::replay_wait] No Metal back-end.");
 }
 std::vector<array> CaptureReplay::read_outputs() {
   throw std::runtime_error("[CaptureReplay::read_outputs] No Metal back-end.");
+}
+array CaptureReplay::read_output(size_t) {
+  throw std::runtime_error("[CaptureReplay::read_output] No Metal back-end.");
+}
+std::vector<array> CaptureReplay::output_arrays(
+    const std::vector<size_t>&) const {
+  throw std::runtime_error("[CaptureReplay::output_arrays] No Metal back-end.");
 }
 bool CaptureReplay::residency_set_active() const {
   return false;

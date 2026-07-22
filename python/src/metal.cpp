@@ -3,6 +3,7 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/unordered_map.h>
@@ -101,6 +102,25 @@ void init_metal(nb::module_& m) {
   });
 
   // --- S2b capture-replay (alpha) ------------------------------------------
+  // A validated device-side feedback plan (S3): P_out -> P_in blits appended to
+  // the replay command buffer. Opaque handle; build it with
+  // CaptureReplay.make_feedback_plan and pass it back to a submit variant.
+  nb::class_<mx::metal::CaptureReplay::FeedbackPlan>(
+      metal,
+      "CaptureReplayFeedbackPlan",
+      R"pbdoc(
+      EXPERIMENTAL (S3). A validated list of (output-leaf -> input-leaf) blits
+      appended to a replay command buffer after the ICB, advancing decode state
+      on-device with zero host bytes. Create it with
+      :meth:`CaptureReplay.make_feedback_plan`.
+      )pbdoc")
+      .def_prop_ro(
+          "num_blits",
+          [](const mx::metal::CaptureReplay::FeedbackPlan& self) {
+            return self.blits.size();
+          },
+          "Number of feedback blits in the plan.");
+
   nb::class_<mx::metal::CaptureReplay>(
       metal,
       "CaptureReplay",
@@ -122,17 +142,57 @@ void init_metal(nb::module_& m) {
           Returns a fresh copy of each pinned output array (submit + wait + read).
           )pbdoc")
       .def(
-          "replay_submit",
-          [](mx::metal::CaptureReplay& self, std::vector<mx::array> inputs) {
+          "make_feedback_plan",
+          [](mx::metal::CaptureReplay& self,
+             std::vector<std::pair<size_t, size_t>> pairs) {
             nb::gil_scoped_release nogil;
-            return self.replay_submit(inputs);
+            return self.make_feedback_plan(pairs);
+          },
+          "pairs"_a,
+          R"pbdoc(
+          Validate and build a :class:`CaptureReplayFeedbackPlan` from a list of
+          ``(output_leaf_index, input_leaf_index)`` pairs. Each pair must be in
+          range and the two leaves byte-size-equal (raises otherwise). Pass the
+          returned plan to :meth:`replay_submit` / :meth:`replay_submit_partial`
+          to blit each state output straight into its state input on-device.
+          )pbdoc")
+      .def(
+          "replay_submit",
+          [](mx::metal::CaptureReplay& self,
+             std::vector<mx::array> inputs,
+             std::shared_ptr<mx::metal::CaptureReplay::FeedbackPlan> plan) {
+            nb::gil_scoped_release nogil;
+            return self.replay_submit(inputs, plan);
           },
           "inputs"_a,
+          "feedback_plan"_a = nb::none(),
           R"pbdoc(
           Write ``inputs`` into the pinned buffers and commit ONE command buffer
           WITHOUT waiting. Returns an integer ticket for :func:`replay_wait`.
           At pipeline depth > 1 successive submits share the pinned input
           buffers; use same-value inputs or external double-buffering.
+          A non-null ``feedback_plan`` appends its P_out->P_in blits to the same
+          command buffer (fenced after the ICB); feedback submits must be serial.
+          )pbdoc")
+      .def(
+          "replay_submit_partial",
+          [](mx::metal::CaptureReplay& self,
+             std::vector<size_t> indices,
+             std::vector<mx::array> arrays,
+             std::shared_ptr<mx::metal::CaptureReplay::FeedbackPlan> plan) {
+            nb::gil_scoped_release nogil;
+            return self.replay_submit_partial(indices, arrays, plan);
+          },
+          "indices"_a,
+          "arrays"_a,
+          "feedback_plan"_a = nb::none(),
+          R"pbdoc(
+          Rewrite ONLY the input leaves in ``indices`` (paired with ``arrays``)
+          into their pinned buffers; every other pinned input is left untouched
+          (it persists the previous submit / feedback-blit contents). Same ticket
+          / wait semantics as :meth:`replay_submit`. Address stability is asserted
+          on the touched leaves (and, with a ``feedback_plan``, on its blit src/
+          dst). Returns a ticket for :func:`replay_wait`.
           )pbdoc")
       .def(
           "replay_wait",
@@ -151,6 +211,32 @@ void init_metal(nb::module_& m) {
           R"pbdoc(
           Copy the current pinned output buffers into fresh host arrays. Call
           after the producing replay has been waited; excluded from timed paths.
+          )pbdoc")
+      .def(
+          "read_output",
+          [](mx::metal::CaptureReplay& self, size_t index) {
+            nb::gil_scoped_release nogil;
+            return self.read_output(index);
+          },
+          "index"_a,
+          R"pbdoc(
+          Copy ONE pinned output leaf into a fresh host array (the selective-read
+          counterpart of :meth:`read_outputs`). Call after the producing replay
+          has been waited.
+          )pbdoc")
+      .def(
+          "output_arrays",
+          [](mx::metal::CaptureReplay& self, std::vector<size_t> indices) {
+            nb::gil_scoped_release nogil;
+            return self.output_arrays(indices);
+          },
+          "indices"_a,
+          R"pbdoc(
+          Zero-copy mx.array views of the pinned output buffers at ``indices``.
+          ALIASING CONTRACT: the views alias the pinned buffers in place and
+          reflect the most recently completed replay; they are only valid until
+          the next replay submit overwrites those buffers. Consume or copy them
+          before resubmitting. No host bytes are moved.
           )pbdoc")
       .def_prop_ro(
           "residency_set_active",

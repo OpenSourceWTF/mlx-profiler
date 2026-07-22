@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -71,16 +72,80 @@ class MLX_API CaptureReplay {
    * fresh copy of each pinned output array. Compat = submit + wait + read. */
   std::vector<array> replay(const std::vector<array>& new_inputs);
 
+  // --- S3 serving: device-side state feedback + selective I/O ---------------
+  //
+  // A feedback plan is a list of (output-leaf, input-leaf) blits appended to the
+  // SAME command buffer AFTER the ICB (an on-device copy P_out -> P_in). It lets
+  // serving keep the advancing decode state on the GPU: instead of copying the
+  // full state out to the host and back in every cycle, the state outputs are
+  // blitted straight into the pinned state inputs, so the next replay reads
+  // advanced state with ZERO host bytes. Combined with replay_submit_partial
+  // (which rewrites only the small cycle-varying leaves — token ids + offsets),
+  // a decode cycle pays only a ~11-leaf host memcpy instead of the full 91-leaf
+  // in / 182-leaf out copy the Phase-1 no-fork path paid.
+  //
+  // Blit ordering: MLX buffers are MTLResourceHazardTrackingModeUntracked, so
+  // Metal does NOT auto-order a blit encoder after a compute encoder. Each
+  // feedback submit therefore fences the ICB compute encoder (updateFence) and
+  // waits on that fence in the blit encoder (waitForFence) — the blits are
+  // guaranteed to observe the ICB's completed outputs. Feedback submits MUST be
+  // serial (submit -> wait per cycle): the fence is reused across cycles and is
+  // only safe with at most one feedback command buffer in flight. That is the
+  // chained-decode cadence; the depth-2 same-value pipeline never uses feedback.
+  struct FeedbackPlan {
+    struct Blit {
+      size_t out_index; // output-leaf index (source, P_out)
+      size_t in_index; // input-leaf index (destination, P_in)
+      size_t nbytes; // validated equal byte size of both leaves
+    };
+    std::vector<Blit> blits;
+  };
+
+  /** Validate and build a feedback plan. Each (out_index, in_index) pair must be
+   * in range and the two leaves must be byte-size-equal. Throws on any invalid
+   * pair. The plan holds indices (resolved to the pinned buffers at submit time,
+   * re-asserting address stability), so it stays valid for the handle's life. */
+  std::shared_ptr<FeedbackPlan> make_feedback_plan(
+      const std::vector<std::pair<size_t, size_t>>& pairs) const;
+
   /** Async split of replay (S3 host-submit isolation / pipelining).
    * replay_submit writes inputs into the pinned buffers and commits ONE command
    * buffer WITHOUT waiting, returning an opaque ticket. replay_wait blocks on a
    * ticket's completion. read_outputs copies the current pinned outputs into
    * fresh host arrays (call after the producing submit has been waited).
    * At pipeline depth > 1 the caller must use same-value inputs OR external
-   * double-buffering — successive submits share the pinned input buffers. */
-  uint64_t replay_submit(const std::vector<array>& new_inputs);
+   * double-buffering — successive submits share the pinned input buffers.
+   *
+   * A non-null feedback_plan appends its P_out -> P_in blits to the same command
+   * buffer after the ICB (fenced, see FeedbackPlan). */
+  uint64_t replay_submit(
+      const std::vector<array>& new_inputs,
+      const std::shared_ptr<FeedbackPlan>& feedback_plan = nullptr);
+
+  /** Partial-rewrite submit: memcpy ONLY the input leaves named in `indices`
+   * (paired with `arrays`) into their pinned buffers; every other pinned input
+   * is left untouched (it persists whatever the previous submit / feedback blit
+   * left there). Address stability is asserted on the touched leaves (and, when a
+   * feedback_plan is given, on its destination inputs). Same ticket / wait
+   * semantics as replay_submit. */
+  uint64_t replay_submit_partial(
+      const std::vector<size_t>& indices,
+      const std::vector<array>& arrays,
+      const std::shared_ptr<FeedbackPlan>& feedback_plan = nullptr);
+
   void replay_wait(uint64_t ticket);
   std::vector<array> read_outputs();
+
+  /** Host copy of ONE output leaf (the selective-read counterpart of
+   * read_outputs). Call after the producing replay has been waited. */
+  array read_output(size_t index);
+
+  /** Zero-copy mx.array views of the pinned output buffers at `indices`.
+   * ALIASING CONTRACT: the returned arrays alias the pinned output buffers in
+   * place — they reflect the most recently completed replay and are only valid
+   * until the next replay submit overwrites those buffers. The caller MUST
+   * consume or copy them before resubmitting. No host bytes are moved. */
+  std::vector<array> output_arrays(const std::vector<size_t>& indices) const;
 
   /** Whether the amortized persistent-residency path is active (macOS 15+). */
   bool residency_set_active() const;
