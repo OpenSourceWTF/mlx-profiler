@@ -126,6 +126,15 @@ void init_metal(nb::module_& m) {
           &mx::metal::CaptureReplay::num_commands,
           "Number of compute commands baked into the ICB.")
       .def_prop_ro(
+          "num_barriers",
+          &mx::metal::CaptureReplay::num_barriers,
+          "Commands carrying a setBarrier() after deferred barrier pruning "
+          "(== num_commands for a fully serial / fully dependent stream).")
+      .def_prop_ro(
+          "largest_barrier_free_run",
+          &mx::metal::CaptureReplay::largest_barrier_free_run,
+          "Longest run of consecutive barrier-free (concurrent) commands.")
+      .def_prop_ro(
           "inputs",
           &mx::metal::CaptureReplay::inputs,
           "The captured input arrays (pinned buffers).")

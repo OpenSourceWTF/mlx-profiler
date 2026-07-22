@@ -300,6 +300,9 @@ void CommandEncoder::set_buffer(
   }
   if (capture::recording()) {
     capture::note_buffer_bind(buf, offset, idx);
+    // set_buffer binds as both input and output -> classify as a write
+    // (conservative; it enters the barrier-pruning hazard write set).
+    capture::note_output_bind(buf);
   }
   get_command_encoder()->setBuffer(buf, offset, idx);
 }
@@ -337,6 +340,13 @@ void CommandEncoder::set_output_array(
 
 void CommandEncoder::register_output_array(const array& a) {
   all_outputs_.insert(a.buffer().ptr());
+
+  if (capture::recording()) {
+    // The output array was just bound via set_input_array's note_buffer_bind;
+    // mark it as WRITTEN by the pending dispatch for deferred barrier pruning.
+    capture::note_output_bind(
+        static_cast<const MTL::Buffer*>(a.buffer().ptr()));
+  }
 
   auto buf = static_cast<MTL::Resource*>(const_cast<void*>(a.buffer().ptr()));
   if (concurrent_) {

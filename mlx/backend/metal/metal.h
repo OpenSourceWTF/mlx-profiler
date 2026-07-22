@@ -73,6 +73,14 @@ class MLX_API CaptureReplay {
   /** Number of compute commands baked into the ICB. */
   size_t num_commands() const;
 
+  /** Number of those commands carrying a setBarrier() after deferred barrier
+   * pruning. Equal to num_commands() for a fully serial / fully dependent
+   * stream (e.g. the alpha toy chain). */
+  size_t num_barriers() const;
+
+  /** Longest run of consecutive barrier-free (concurrent) commands. */
+  size_t largest_barrier_free_run() const;
+
   /** The captured input / output arrays (pinned buffers). */
   const std::vector<array>& inputs() const;
   const std::vector<array>& outputs() const;

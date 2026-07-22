@@ -45,6 +45,12 @@ std::vector<array> CaptureReplay::replay(const std::vector<array>&) {
 size_t CaptureReplay::num_commands() const {
   return 0;
 }
+size_t CaptureReplay::num_barriers() const {
+  return 0;
+}
+size_t CaptureReplay::largest_barrier_free_run() const {
+  return 0;
+}
 const std::vector<array>& CaptureReplay::inputs() const {
   static std::vector<array> empty;
   return empty;

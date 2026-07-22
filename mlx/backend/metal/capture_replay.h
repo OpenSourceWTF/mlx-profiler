@@ -55,6 +55,9 @@ inline bool recording() {
 // finalizes the in-progress command and starts a fresh one.
 void note_pipeline(MTL::ComputePipelineState* pipeline);
 void note_buffer_bind(const MTL::Buffer* buf, uint64_t offset, uint32_t index);
+// Classify an already-bound buffer as WRITTEN by the pending dispatch (drives
+// deferred barrier pruning). Called from register_output_array and set_buffer.
+void note_output_bind(const MTL::Buffer* buf);
 void note_set_bytes(const void* data, std::size_t nbytes, uint32_t index);
 void note_threadgroup_mem(std::size_t length, uint32_t index);
 void note_dispatch_threads(MTL::Size grid, MTL::Size group);

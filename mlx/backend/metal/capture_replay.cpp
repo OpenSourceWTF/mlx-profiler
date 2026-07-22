@@ -16,9 +16,12 @@
 //     numerics);
 //   * every setBytes value is baked once as an ICB kernel-buffer argument
 //     (indirect commands cannot use setBytes);
-//   * every command gets setBarrier() — correctness first; the concurrent
-//     encoder + per-command barrier is a strict superset of MLX's dependency
-//     edges (dependency-pruning is future work).
+//   * setBarrier() is set only where a true hazard exists — a command that
+//     touches a buffer written since the previous barrier (deferred barrier
+//     pruning). A barrier makes all prior commands complete before this one, so
+//     it clears the accumulated write set; independent commands between barriers
+//     run concurrently. (The alpha put a barrier on every command — fully
+//     serial — which the real graph's many small kernels paid heavily for.)
 // Every MTLBuffer the stream touches is pinned in the allocator so its address
 // is stable; replay() writes new input values into the pinned input buffers and
 // issues a single executeCommandsInBuffer.
@@ -49,6 +52,11 @@
 //     real free ONLY for those; a still-owned pinned buffer is just un-pinned.
 //     Without this, ~Impl would recycle/release live weights at handle
 //     destruction. The toy only pins buffers it exclusively owns → unchanged.
+//   * Deferred barrier pruning (perf): setBarrier() is emitted only on a command
+//     that touches a buffer written since the previous barrier, instead of on
+//     every command. This lets the bulk of each layer's independent kernels run
+//     concurrently; num_barriers()/largest_barrier_free_run() report the result.
+//     The toy's fully dependent chain still gets ~a barrier per command.
 //
 // Invariants STILL NOT handled (these WILL break a graph):
 //   * Allocator reuse across evals: pinning holds captured buffers, but any
@@ -132,6 +140,10 @@ struct DispatchRec {
   std::vector<BufferBind> buffers;
   std::vector<BytesBind> bytes;
   std::vector<TgMemBind> tgmem;
+  // Buffers this dispatch WRITES (from set_output_array/register_output_array
+  // and set_buffer's dual in/out binds). Drives the deferred barrier-pruning
+  // hazard rule; the read set is every bound buffer in `buffers`.
+  std::unordered_set<const MTL::Buffer*> write_bufs;
   bool uses_threads = false; // true: dispatchThreads, false: dispatchThreadgroups
   MTL::Size grid{1, 1, 1};
   MTL::Size group{1, 1, 1};
@@ -210,6 +222,15 @@ void note_buffer_bind(
   g_rec.distinct_buffers.insert(buf);
 }
 
+void note_output_bind(const MTL::Buffer* buf) {
+  // Called from register_output_array (an output array bind) and set_buffer (a
+  // dual in/out bind) to classify `buf` as WRITTEN by the pending dispatch.
+  // Conservative: any buffer we are unsure about is a write, which only adds
+  // barriers. The address is already pinned by the preceding note_buffer_bind.
+  std::lock_guard<std::mutex> lk(g_rec.mtx);
+  g_rec.pending.write_bufs.insert(buf);
+}
+
 void note_set_bytes(const void* data, std::size_t nbytes, uint32_t index) {
   std::lock_guard<std::mutex> lk(g_rec.mtx);
   BytesBind b;
@@ -281,6 +302,13 @@ struct CaptureReplay::Impl {
 
   size_t num_commands = 0;
 
+  // Deferred barrier-pruning stats (see capture()): how many of the commands
+  // carry a setBarrier(), and the longest run of consecutive barrier-free
+  // (concurrent) commands. num_barriers == num_commands means fully serial
+  // (the alpha behaviour / a fully dependent chain like the toy).
+  size_t num_barriers = 0;
+  size_t largest_barrier_free_run = 0;
+
   // Distinct pinned buffers (arena) — used for useResources and, at teardown,
   // for the deferred allocator free.
   std::vector<MTL::Buffer*> arena;
@@ -330,6 +358,14 @@ CaptureReplay::~CaptureReplay() = default;
 
 size_t CaptureReplay::num_commands() const {
   return impl_->num_commands;
+}
+
+size_t CaptureReplay::num_barriers() const {
+  return impl_->num_barriers;
+}
+
+size_t CaptureReplay::largest_barrier_free_run() const {
+  return impl_->largest_barrier_free_run;
 }
 
 const std::vector<array>& CaptureReplay::inputs() const {
@@ -540,6 +576,24 @@ std::shared_ptr<CaptureReplay> CaptureReplay::capture(
     fail("[CaptureReplay::capture] Failed to allocate indirect command buffer.");
   }
 
+  // Deferred barrier pruning (replaces the alpha's per-command barrier). The
+  // alpha put setBarrier() on every command, fully serializing the stream on the
+  // GPU — the real A3B graph's many small kernels pay heavily for that. Instead
+  // we set a barrier ONLY where a true hazard exists: a command that touches a
+  // buffer WRITTEN by any command since the previous barrier. A barrier makes
+  // all prior commands complete before this one, so it clears the accumulated
+  // write set; independent commands between barriers run concurrently.
+  //
+  // Rule (conservative RAW/WAW; WAR is a non-issue here because inputs are held
+  // non-donatable and every intermediate has a single writer that precedes its
+  // reads, so a written buffer is always already in W): for command i, if any
+  // bound buffer (read set) or written buffer is in W -> barrier, reset W, then
+  // W |= writes_i; else W |= writes_i. A pruning miss would surface as a bitwise
+  // mismatch in the bench (the safety net), never a silent wrong answer.
+  std::unordered_set<const MTL::Buffer*> write_window;
+  size_t barrier_count = 0;
+  size_t current_run = 0;
+  size_t largest_run = 0;
   for (size_t i = 0; i < dispatches.size(); ++i) {
     auto& disp = dispatches[i];
     auto* cmd = impl->icb->indirectComputeCommand(i);
@@ -559,9 +613,39 @@ std::shared_ptr<CaptureReplay> CaptureReplay::capture(
     } else {
       cmd->concurrentDispatchThreadgroups(disp.grid, disp.group);
     }
-    // Alpha: one barrier per command — correctness over throughput.
-    cmd->setBarrier();
+
+    bool hazard = false;
+    if (!write_window.empty()) {
+      for (auto& bb : disp.buffers) { // read set = every bound buffer
+        if (write_window.count(bb.buf)) {
+          hazard = true;
+          break;
+        }
+      }
+      if (!hazard) {
+        for (auto* wb : disp.write_bufs) { // WAW against the write window
+          if (write_window.count(wb)) {
+            hazard = true;
+            break;
+          }
+        }
+      }
+    }
+    if (hazard) {
+      cmd->setBarrier();
+      ++barrier_count;
+      write_window.clear();
+      largest_run = std::max(largest_run, current_run);
+      current_run = 0;
+    }
+    ++current_run;
+    for (auto* wb : disp.write_bufs) {
+      write_window.insert(wb);
+    }
   }
+  largest_run = std::max(largest_run, current_run);
+  impl->num_barriers = barrier_count;
+  impl->largest_barrier_free_run = largest_run;
 
   // 4. Dedicated command queue for replay submission.
   impl->queue = NS::TransferPtr(mtl_device->newCommandQueue());
