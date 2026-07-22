@@ -200,10 +200,13 @@ void MetalAllocator::free(Buffer buffer) {
   std::unique_lock lk(mutex_);
   // S2b: a pinned buffer is owned by an active capture handle. Defer its free
   // entirely — do not decrement active_memory_ (it is still resident), do not
-  // recycle it to the reuse cache, and do not release it. unpin() runs the
-  // real free later. This is what keeps a captured buffer's address stable and
-  // forbids the allocator from handing it to a different array mid-replay.
+  // recycle it to the reuse cache, and do not release it. Record that a free
+  // was requested so unpin() knows this buffer's last non-capture owner is gone
+  // and it is safe to run the real free later. This keeps a captured buffer's
+  // address stable and forbids the allocator from handing it to a different
+  // array mid-replay.
   if (!pinned_.empty() && pinned_.find(buf) != pinned_.end()) {
+    deferred_free_.insert(buf);
     return;
   }
   active_memory_ -= buf->length();
@@ -255,9 +258,17 @@ void MetalAllocator::unpin(MTL::Buffer* buf) {
     return;
   }
   pinned_.erase(it);
-  // Perform the free that free() deferred while the buffer was pinned. Mirror
-  // free()'s recycle-or-release logic exactly so allocator accounting stays
-  // consistent (malloc incremented active_memory_/num_resources_ at capture).
+  // Perform the free ONLY if one was deferred while the buffer was pinned. A
+  // pinned buffer with no deferred free is still owned by a live array (e.g. a
+  // model weight bound by a captured dispatch): unpinning must not recycle or
+  // release it, or that owner is left dangling. Just drop the pin.
+  auto df = deferred_free_.find(buf);
+  if (df == deferred_free_.end()) {
+    return;
+  }
+  deferred_free_.erase(df);
+  // Mirror free()'s recycle-or-release logic exactly so allocator accounting
+  // stays consistent (malloc incremented active_memory_/num_resources_).
   active_memory_ -= buf->length();
   if (get_cache_memory() < max_pool_size_) {
     buffer_cache_.recycle_to_cache(buf);

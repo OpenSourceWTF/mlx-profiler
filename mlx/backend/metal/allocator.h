@@ -47,9 +47,17 @@ class MetalAllocator : public allocator::Allocator {
   // A pinned buffer is excluded from the reuse cache and never released while
   // pinned: its address is stable for the lifetime of a CaptureReplay handle.
   // pin() marks a buffer that is still owned by a live array; a later free()
-  // for that buffer is deferred (skipped) until unpin() performs the real
-  // free. This forbids allocator reuse/donation of any buffer the captured
+  // for that buffer is deferred (recorded, skipped) until unpin() performs the
+  // real free. This forbids allocator reuse/donation of any buffer the captured
   // ICB references. See capture_replay.cpp.
+  //
+  // S2b-beta: unpin() performs the real free ONLY for buffers whose free() was
+  // actually deferred while pinned. The real A3B graph pins many buffers that
+  // stay owned by live arrays (model weights bound by matmul/qmm dispatches) and
+  // are never freed during the handle's life; unpinning those must be a no-op,
+  // or the still-owned buffer would be recycled/released out from under its
+  // owner. The toy graph only pins buffers it exclusively owns, so its behaviour
+  // is unchanged.
   void pin(MTL::Buffer* buf);
   void unpin(MTL::Buffer* buf);
 
@@ -85,6 +93,10 @@ class MetalAllocator : public allocator::Allocator {
 
   // Buffers pinned by an active capture (guarded by mutex_).
   std::unordered_set<MTL::Buffer*> pinned_;
+  // Pinned buffers whose free() arrived while pinned and was deferred. unpin()
+  // frees exactly these (buffers the capture is the last owner of); a pinned
+  // buffer absent here is still owned elsewhere and unpin() leaves it be.
+  std::unordered_set<MTL::Buffer*> deferred_free_;
 
   std::mutex mutex_;
 };

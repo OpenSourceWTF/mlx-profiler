@@ -42,6 +42,13 @@
 //     each kernel's linked (private) functions too, and capture() rebuilds the
 //     ICB pipeline with a matching MTL::LinkedFunctions set. Empty for plain
 //     kernels (the toy), so no behaviour change there.
+//   * Teardown safety (allocator): the real graph pins buffers that stay owned
+//     by live arrays — model weights bound by matmul/qmm dispatches, and state
+//     leaves co-owned by the route's cache. The allocator now defers a pinned
+//     buffer's free only when free() is actually requested, and unpin() runs the
+//     real free ONLY for those; a still-owned pinned buffer is just un-pinned.
+//     Without this, ~Impl would recycle/release live weights at handle
+//     destruction. The toy only pins buffers it exclusively owns → unchanged.
 //
 // Invariants STILL NOT handled (these WILL break a graph):
 //   * Allocator reuse across evals: pinning holds captured buffers, but any
@@ -299,9 +306,12 @@ struct CaptureReplay::Impl {
     icb_pipelines.clear();
     queue.reset();
     // Destroy the captured arrays BEFORE unpinning: their Data destructors call
-    // allocator.free() on the pinned buffers, which defers (no-op) while still
-    // pinned. Only after the arrays are gone do we unpin — that performs the
-    // single real free (recycle to cache) with no other owner left.
+    // allocator.free() on the pinned buffers, which is deferred (recorded) while
+    // still pinned. Then unpin() runs the real free for exactly the buffers
+    // whose free was deferred (the ones the capture was the last owner of —
+    // intermediates and the input/output leaves); buffers still owned elsewhere
+    // (model weights, state leaves co-owned by the route) are simply un-pinned,
+    // never freed here. See allocator.cpp free()/unpin() and deferred_free_.
     inputs.clear();
     outputs.clear();
     input_bufs.clear();
