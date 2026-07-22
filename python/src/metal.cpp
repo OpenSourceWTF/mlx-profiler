@@ -3,15 +3,19 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/unordered_map.h>
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 
+#include "mlx/array.h"
 #include "mlx/backend/metal/metal.h"
 #include "mlx/device.h"
 #include "mlx/memory.h"
+#include "mlx/transforms.h"
 #include "python/src/small_vector.h"
+#include "python/src/trees.h"
 
 namespace mx = mlx::core;
 namespace nb = nanobind;
@@ -95,4 +99,76 @@ void init_metal(nb::module_& m) {
     DEPRECATE("mx.metal.device_info", "mx.device_info");
     return mx::device_info(mx::Device(mx::Device::gpu, 0));
   });
+
+  // --- S2b capture-replay (alpha) ------------------------------------------
+  nb::class_<mx::metal::CaptureReplay>(
+      metal,
+      "CaptureReplay",
+      R"pbdoc(
+      EXPERIMENTAL (S2b alpha). A replayable handle over the compute dispatch
+      stream of one eval of a compiled graph, baked into an
+      MTLIndirectCommandBuffer. Create it with :func:`capture_compiled`.
+      )pbdoc")
+      .def(
+          "replay",
+          [](mx::metal::CaptureReplay& self, std::vector<mx::array> inputs) {
+            nb::gil_scoped_release nogil;
+            return self.replay(inputs);
+          },
+          "inputs"_a,
+          R"pbdoc(
+          Write ``inputs`` into the pinned input buffers (address-stability
+          asserted) and submit one command buffer that executes the ICB.
+          Returns a fresh copy of each pinned output array.
+          )pbdoc")
+      .def_prop_ro(
+          "num_commands",
+          &mx::metal::CaptureReplay::num_commands,
+          "Number of compute commands baked into the ICB.")
+      .def_prop_ro(
+          "inputs",
+          &mx::metal::CaptureReplay::inputs,
+          "The captured input arrays (pinned buffers).")
+      .def_prop_ro(
+          "outputs",
+          &mx::metal::CaptureReplay::outputs,
+          "The captured output arrays (pinned buffers).");
+
+  metal.def(
+      "capture_compiled",
+      [](nb::callable fn, nb::args example_inputs) {
+        std::vector<mx::array> inputs = tree_flatten(example_inputs, false);
+        // Warm / compile: run once and eval so the compiled trace exists and
+        // the input leaves are materialized (NOT recorded).
+        {
+          nb::object warm = fn(*example_inputs);
+          std::vector<mx::array> warm_out = tree_flatten(warm, false);
+          nb::gil_scoped_release nogil;
+          mx::eval(inputs);
+          mx::eval(warm_out);
+        }
+        // Build the graph again and record the steady-state dispatch stream.
+        nb::object outs = fn(*example_inputs);
+        std::vector<mx::array> outputs = tree_flatten(outs, false);
+        mx::metal::capture_begin();
+        {
+          nb::gil_scoped_release nogil;
+          mx::eval(outputs);
+        }
+        return mx::metal::CaptureReplay::capture(inputs, outputs);
+      },
+      R"pbdoc(
+      EXPERIMENTAL (S2b alpha). Capture the compute dispatch stream of a
+      compiled function ``fn`` evaluated on ``example_inputs`` into a
+      replayable :class:`CaptureReplay` handle.
+
+      Requires the environment variable ``MLX_CAPTURE_REPLAY`` to be set before
+      importing mlx (it makes the Metal Device retain kernel functions so the
+      captured pipelines can be rebuilt with indirect-command-buffer support).
+
+      Args:
+        fn (Callable): A (typically ``mx.compile``-d) function of the inputs.
+        *example_inputs (array): Example array inputs; their buffers are pinned
+          and rewritten on replay.
+      )pbdoc");
 }

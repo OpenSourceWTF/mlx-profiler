@@ -4,6 +4,7 @@
 
 #include <map>
 #include <mutex>
+#include <unordered_set>
 #include <vector>
 
 #include "mlx/allocator.h"
@@ -42,6 +43,16 @@ class MetalAllocator : public allocator::Allocator {
   size_t set_wired_limit(size_t limit);
   void clear_cache();
 
+  // --- S2b capture-replay pinning (alpha) ---------------------------------
+  // A pinned buffer is excluded from the reuse cache and never released while
+  // pinned: its address is stable for the lifetime of a CaptureReplay handle.
+  // pin() marks a buffer that is still owned by a live array; a later free()
+  // for that buffer is deferred (skipped) until unpin() performs the real
+  // free. This forbids allocator reuse/donation of any buffer the captured
+  // ICB references. See capture_replay.cpp.
+  void pin(MTL::Buffer* buf);
+  void unpin(MTL::Buffer* buf);
+
  private:
   MTL::Device* device_;
 
@@ -71,6 +82,9 @@ class MetalAllocator : public allocator::Allocator {
   size_t wired_limit_{0};
   size_t num_resources_{0};
   size_t resource_limit_{0};
+
+  // Buffers pinned by an active capture (guarded by mutex_).
+  std::unordered_set<MTL::Buffer*> pinned_;
 
   std::mutex mutex_;
 };

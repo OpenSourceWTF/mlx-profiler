@@ -12,6 +12,7 @@
 
 #include "mlx/array.h"
 #include "mlx/backend/common/dispatch_census.h"
+#include "mlx/backend/metal/capture_replay.h"
 #include "mlx/backend/metal/resident.h"
 #include "mlx/device.h"
 
@@ -61,16 +62,22 @@ class MLX_API CommandEncoder {
     if (census::enabled()) {
       census::note_pipeline(kernel);
     }
+    if (capture::recording()) {
+      capture::note_pipeline(kernel);
+    }
     get_command_encoder()->setComputePipelineState(kernel);
   }
 
   template <typename Vec, typename = std::enable_if_t<is_vector_v<Vec>>>
   void set_vector_bytes(const Vec& vec, size_t nelems, int idx) {
+    const size_t nbytes = nelems * sizeof(typename Vec::value_type);
     if (census::enabled()) {
-      census::note_set_bytes(nelems * sizeof(typename Vec::value_type));
+      census::note_set_bytes(nbytes);
     }
-    get_command_encoder()->setBytes(
-        vec.data(), nelems * sizeof(typename Vec::value_type), idx);
+    if (capture::recording()) {
+      capture::note_set_bytes(vec.data(), nbytes, idx);
+    }
+    get_command_encoder()->setBytes(vec.data(), nbytes, idx);
   }
   template <typename Vec, typename = std::enable_if_t<is_vector_v<Vec>>>
   void set_vector_bytes(const Vec& vec, int idx) {
@@ -82,6 +89,9 @@ class MLX_API CommandEncoder {
     if (census::enabled()) {
       census::note_set_bytes(n * sizeof(T));
     }
+    if (capture::recording()) {
+      capture::note_set_bytes(v, n * sizeof(T), idx);
+    }
     return get_command_encoder()->setBytes(v, n * sizeof(T), idx);
   }
 
@@ -90,10 +100,16 @@ class MLX_API CommandEncoder {
     if (census::enabled()) {
       census::note_set_bytes(sizeof(T));
     }
+    if (capture::recording()) {
+      capture::note_set_bytes(&v, sizeof(T), idx);
+    }
     return get_command_encoder()->setBytes(&v, sizeof(T), idx);
   }
 
   void set_threadgroup_memory_length(size_t length, int idx) {
+    if (capture::recording()) {
+      capture::note_threadgroup_mem(length, idx);
+    }
     get_command_encoder()->setThreadgroupMemoryLength(length, idx);
   }
 

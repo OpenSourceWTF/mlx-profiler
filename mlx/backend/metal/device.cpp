@@ -298,6 +298,9 @@ void CommandEncoder::set_buffer(
   if (census::enabled()) {
     census::note_buffer_bind();
   }
+  if (capture::recording()) {
+    capture::note_buffer_bind(buf, offset, idx);
+  }
   get_command_encoder()->setBuffer(buf, offset, idx);
 }
 
@@ -316,6 +319,9 @@ void CommandEncoder::set_input_array(
   // output array binds.
   if (census::enabled()) {
     census::note_buffer_bind();
+  }
+  if (capture::recording()) {
+    capture::note_buffer_bind(a_buf, a.offset() + offset, idx);
   }
   get_command_encoder()->setBuffer(a_buf, a.offset() + offset, idx);
 }
@@ -374,6 +380,9 @@ void CommandEncoder::dispatch_threadgroups(
         census::Dim3{grid_dims.width, grid_dims.height, grid_dims.depth},
         census::Dim3{group_dims.width, group_dims.height, group_dims.depth});
   }
+  if (capture::recording()) {
+    capture::note_dispatch_threadgroups(grid_dims, group_dims);
+  }
 }
 
 void CommandEncoder::dispatch_threads(
@@ -387,6 +396,9 @@ void CommandEncoder::dispatch_threads(
         "threads",
         census::Dim3{grid_dims.width, grid_dims.height, grid_dims.depth},
         census::Dim3{group_dims.width, group_dims.height, group_dims.depth});
+  }
+  if (capture::recording()) {
+    capture::note_dispatch_threads(grid_dims, group_dims);
   }
 }
 
@@ -802,6 +814,13 @@ MTL::ComputePipelineState* Device::get_kernel_(
   // Record pipeline -> name so the census can label each dispatch.
   if (census::enabled()) {
     census::register_kernel(kernel.get(), hash_name.c_str());
+  }
+
+  // S2b: when capture is armed, retain the MTL::Function this pipeline was
+  // built from so a captured pipeline can be re-created with
+  // supportIndirectCommandBuffers=YES for use inside an ICB.
+  if (capture::enabled()) {
+    capture::register_kernel_function(kernel.get(), mtl_function.get());
   }
 
   return kernel.get();

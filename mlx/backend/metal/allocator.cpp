@@ -198,6 +198,14 @@ void MetalAllocator::free(Buffer buffer) {
     return;
   }
   std::unique_lock lk(mutex_);
+  // S2b: a pinned buffer is owned by an active capture handle. Defer its free
+  // entirely — do not decrement active_memory_ (it is still resident), do not
+  // recycle it to the reuse cache, and do not release it. unpin() runs the
+  // real free later. This is what keeps a captured buffer's address stable and
+  // forbids the allocator from handing it to a different array mid-replay.
+  if (!pinned_.empty() && pinned_.find(buf) != pinned_.end()) {
+    return;
+  }
   active_memory_ -= buf->length();
   if (get_cache_memory() < max_pool_size_) {
     buffer_cache_.recycle_to_cache(buf);
@@ -227,6 +235,41 @@ Buffer MetalAllocator::make_buffer(void* ptr, size_t size) {
   peak_memory_ = std::max(peak_memory_, active_memory_);
   num_resources_++;
   return Buffer{static_cast<void*>(buf)};
+}
+
+void MetalAllocator::pin(MTL::Buffer* buf) {
+  if (buf == nullptr) {
+    return;
+  }
+  std::unique_lock lk(mutex_);
+  pinned_.insert(buf);
+}
+
+void MetalAllocator::unpin(MTL::Buffer* buf) {
+  if (buf == nullptr) {
+    return;
+  }
+  std::unique_lock lk(mutex_);
+  auto it = pinned_.find(buf);
+  if (it == pinned_.end()) {
+    return;
+  }
+  pinned_.erase(it);
+  // Perform the free that free() deferred while the buffer was pinned. Mirror
+  // free()'s recycle-or-release logic exactly so allocator accounting stays
+  // consistent (malloc incremented active_memory_/num_resources_ at capture).
+  active_memory_ -= buf->length();
+  if (get_cache_memory() < max_pool_size_) {
+    buffer_cache_.recycle_to_cache(buf);
+  } else {
+    num_resources_--;
+    if (!buf->heap()) {
+      residency_set_.erase(buf);
+    }
+    lk.unlock();
+    auto pool = metal::new_scoped_memory_pool();
+    buf->release();
+  }
 }
 
 void MetalAllocator::release(Buffer buffer) {
