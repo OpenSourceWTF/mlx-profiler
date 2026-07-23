@@ -363,7 +363,14 @@ void init_metal(nb::module_& m) {
       .def_prop_ro(
           "outputs",
           &mx::metal::CaptureReplay::outputs,
-          "The captured output arrays (pinned buffers).");
+          "The captured output arrays (pinned buffers).")
+      .def_prop_ro(
+          "command_kernel_names",
+          &mx::metal::CaptureReplay::command_kernel_names,
+          "Per-command kernel names (one per ICB command, dispatch order; length "
+          "== num_commands). Read-only capture metadata for the W1b within-stage "
+          "split's per-group kernel histogram (report §40); empty string where the "
+          "function was not retained.");
 
   metal.def(
       "capture_compiled",
@@ -495,6 +502,7 @@ void init_metal(nb::module_& m) {
           d["is_blit"] = s.is_blit;
           d["duration_ns"] = s.duration_ns;
           d["valid"] = s.valid;
+          d["group_index"] = s.group_index;
           out.append(d);
         }
         return out;
@@ -508,11 +516,14 @@ void init_metal(nb::module_& m) {
 
       Returns a list of per-encoder GPU stage-boundary spans (one dict per encoder
       the chain emitted, in encoder order): ``{"stage_index": int, "is_blit": bool,
-      "duration_ns": int, "valid": bool}``. ``stage_index`` indexes the ``stages``
-      passed to :func:`chain_submit` (append/draft/m2/target); ``is_blit`` is False
-      for the stage's ICB compute encoder and True for its trailing feedback/handoff
-      blit encoder. The list is EMPTY when GPU counter sampling is unavailable at
-      runtime (fail-open) — the timing is diagnostic and never affects the decode.
+      "duration_ns": int, "valid": bool, "group_index": int}``. ``stage_index``
+      indexes the ``stages`` passed to :func:`chain_submit` (append/draft/m2/target);
+      ``is_blit`` is False for the stage's ICB compute encoder and True for its
+      trailing feedback/handoff blit encoder. ``group_index`` is 0 for every un-split
+      encoder; when the W1b within-stage split is active (report §40) the split
+      stage's compute encoders carry their 0-based group index in ICB-command order.
+      The list is EMPTY when GPU counter sampling is unavailable at runtime
+      (fail-open) — the timing is diagnostic and never affects the decode.
       )pbdoc");
 
   metal.def(
@@ -532,5 +543,37 @@ void init_metal(nb::module_& m) {
       Falls back to ``fallback_ns_per_tick`` (the static mach timebase) only when the
       correlation is degenerate (``gpu_delta_ticks == 0``). Returns a NEGATIVE value
       when neither a correlation nor a fallback scale is available.
+      )pbdoc");
+
+  metal.def(
+      "chain_parse_split_spec",
+      [](const std::string& spec, uint64_t num_commands) {
+        auto plan = mx::metal::chain_parse_split_spec(spec, num_commands);
+        nb::dict d;
+        d["valid"] = plan.valid;
+        d["stage_index"] = plan.stage_index;
+        nb::list groups;
+        for (const auto& g : plan.groups) {
+          nb::list pr;
+          pr.append(g.first);
+          pr.append(g.second);
+          groups.append(pr);
+        }
+        d["groups"] = groups;
+        return d;
+      },
+      "spec"_a, "num_commands"_a,
+      R"pbdoc(
+      Parse a W1b within-stage split spec (report §40) against a stage's
+      ``num_commands`` into ``{"valid": bool, "stage_index": int, "groups":
+      [[start, count], ...]}``. ``spec`` is ``"<stage_index>:<i1>,<i2>,..."`` —
+      ascending command-index split points carving the stage's ``[0, num_commands)``
+      ICB into contiguous groups. ``valid`` is False (with empty ``groups``) on ANY
+      malformation, an empty split list, a non-ascending index, or an index outside
+      ``(0, num_commands)`` — the byte-identical single-encoder path. This is the
+      SAME parser :func:`chain_submit` uses to decide the split (it reads the spec
+      from ``MLX_CHAIN_GPU_TIMING_M2_SPLIT``), exposed so a controller derives the
+      EXACT same group boundaries for reporting + the per-group kernel histogram.
+      Pure — no Metal state, no GPU work.
       )pbdoc");
 }

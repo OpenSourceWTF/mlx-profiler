@@ -353,6 +353,12 @@ struct CaptureReplay::Impl {
   // for the deferred allocator free.
   std::vector<MTL::Buffer*> arena;
 
+  // Per-command kernel name (primary MTL::Function name), one entry per ICB
+  // command in dispatch order (size == num_commands). Recorded once at capture;
+  // read-only metadata for the W1b within-stage split's per-group kernel histogram
+  // (report §40). Empty string for a command whose function was not retained.
+  std::vector<std::string> command_kernel_names;
+
   // Distinct MTL heaps backing arena sub-allocations. MLX suballocates buffers
   // smaller than 256 B from a shared heap; the replay queue does NOT carry the
   // allocator's residency set (which wires the heap), so those small buffers
@@ -459,6 +465,10 @@ const std::vector<array>& CaptureReplay::outputs() const {
   return impl_->outputs;
 }
 
+const std::vector<std::string>& CaptureReplay::command_kernel_names() const {
+  return impl_->command_kernel_names;
+}
+
 void capture_begin() {
   if (!capture::enabled()) {
     throw std::runtime_error(
@@ -510,6 +520,20 @@ std::shared_ptr<CaptureReplay> CaptureReplay::capture(
   auto impl = std::make_unique<Impl>();
   impl->arena = arena;
   impl->num_commands = dispatches.size();
+
+  // Per-command kernel names (W1b within-stage split, report §40). Recorded once
+  // here from the retained function registry so a split's per-group kernel-name
+  // histogram is auditable. Cheap host-side metadata: it is never read by replay
+  // and does not touch the ICB, so it leaves the gate-off / non-split path exactly
+  // byte-identical. Empty for a command whose function was not retained.
+  impl->command_kernel_names.reserve(dispatches.size());
+  for (auto& disp : dispatches) {
+    MTL::Function* fn = capture::function_for_pipeline(disp.pipeline);
+    const char* nm =
+        (fn != nullptr && fn->name() != nullptr) ? fn->name()->utf8String()
+                                                 : nullptr;
+    impl->command_kernel_names.emplace_back(nm != nullptr ? nm : "");
+  }
 
   // Blocker 2: gather the distinct heaps backing any sub-allocated arena buffer
   // so replay can wire them explicitly (the replay queue has no residency set).
@@ -1323,6 +1347,7 @@ namespace {
 struct ChainEncoderTag {
   uint32_t stage_index;
   bool is_blit;
+  uint32_t group_index; // 0 for un-split encoders; the split group otherwise (§40)
 };
 struct ChainInflight {
   NS::SharedPtr<MTL::CommandBuffer> cb;
@@ -1360,6 +1385,21 @@ bool chain_gpu_timing_enabled() {
     return v != nullptr && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
   }();
   return on;
+}
+
+// The raw W1b within-stage split spec (report §40), read ONCE from
+// MLX_CHAIN_GPU_TIMING_M2_SPLIT. Empty (default) ⇒ no split ⇒ each stage keeps its
+// single full-range compute encoder (byte-identical). Parsed per-stage by
+// chain_parse_split_spec against that stage's num_commands, and applied only when
+// GPU timing sampling actually engages (splitting without measurement would only
+// perturb the wall). Format: "<stage_index>:<i1>,<i2>,..." (ascending command
+// indices). See chain_parse_split_spec for the fail-open rules.
+const std::string& chain_m2_split_spec() {
+  static const std::string spec = [] {
+    const char* v = std::getenv("MLX_CHAIN_GPU_TIMING_M2_SPLIT");
+    return std::string(v != nullptr ? v : "");
+  }();
+  return spec;
 }
 
 // The device's timestamp MTLCounterSet (nullptr if it has none). Cheap linear
@@ -1444,6 +1484,91 @@ void chain_use_arena(MTL::ComputeCommandEncoder* enc, CaptureReplay::Impl& impl)
 }
 
 } // namespace
+
+ChainSplitPlan chain_parse_split_spec(
+    const std::string& spec,
+    uint64_t num_commands) {
+  // Fail-open pure parser (report §40). "<stage_index>:<i1>,<i2>,...": a stage
+  // index, then ascending command-index split points strictly inside
+  // (0, num_commands). ANY malformation / empty list / non-ascending / out-of-range
+  // index ⇒ valid=false, empty groups (the caller then takes the single-encoder
+  // byte-identical path). Groups are the contiguous [start,count) ranges the split
+  // points carve out of [0, num_commands).
+  ChainSplitPlan plan;
+  auto colon = spec.find(':');
+  if (colon == std::string::npos) {
+    return plan;
+  }
+  const std::string head = spec.substr(0, colon);
+  const std::string tail = spec.substr(colon + 1);
+  if (head.empty()) {
+    return plan;
+  }
+  // Stage index: digits only (no sign / space).
+  uint64_t stage = 0;
+  for (char c : head) {
+    if (c < '0' || c > '9') {
+      return plan;
+    }
+    stage = stage * 10 + static_cast<uint64_t>(c - '0');
+    if (stage > 0xffffffffULL) {
+      return plan;
+    }
+  }
+  // Split indices: comma-separated non-negative integers.
+  std::vector<uint64_t> idx;
+  uint64_t cur = 0;
+  bool any_digit = false;
+  auto flush = [&]() -> bool {
+    if (!any_digit) {
+      return false;
+    }
+    idx.push_back(cur);
+    cur = 0;
+    any_digit = false;
+    return true;
+  };
+  for (char c : tail) {
+    if (c == ',') {
+      if (!flush()) {
+        return plan;
+      }
+    } else if (c >= '0' && c <= '9') {
+      cur = cur * 10 + static_cast<uint64_t>(c - '0');
+      any_digit = true;
+      if (cur > 0xffffffffULL) {
+        return plan;
+      }
+    } else {
+      return plan; // whitespace / sign / any other char ⇒ invalid
+    }
+  }
+  if (!flush()) {
+    return plan; // trailing comma or empty split list
+  }
+  if (idx.empty() || num_commands == 0) {
+    return plan;
+  }
+  // Strictly ascending, each strictly inside (0, num_commands).
+  uint64_t prev = 0;
+  for (uint64_t v : idx) {
+    if (v <= prev || v >= num_commands) {
+      return plan;
+    }
+    prev = v;
+  }
+  // Carve [0, num_commands) into contiguous groups at the split points.
+  plan.groups.reserve(idx.size() + 1);
+  uint64_t start = 0;
+  for (uint64_t v : idx) {
+    plan.groups.emplace_back(start, v - start);
+    start = v;
+  }
+  plan.groups.emplace_back(start, num_commands - start);
+  plan.valid = true;
+  plan.stage_index = static_cast<uint32_t>(stage);
+  return plan;
+}
 
 std::shared_ptr<ChainPlan> make_chain_plan(
     const std::shared_ptr<CaptureReplay>& src,
@@ -1590,22 +1715,54 @@ uint64_t chain_submit(
 
   auto* cb = g_chain_queue->commandBuffer();
 
+  // --- W1b within-stage split plan (report §40) ------------------------------
+  // Default: each stage runs its ICB in ONE full-range compute encoder. When the
+  // split spec (MLX_CHAIN_GPU_TIMING_M2_SPLIT) names a stage and GPU timing is on,
+  // that stage's ICB is carved into contiguous command-index groups, each emitted
+  // as its own fenced sub-encoder (below) so it can be sampled separately — the
+  // within-stage attribution. The split is APPLIED only when sampling actually
+  // engages (checked after the sampler is built); the group plan is computed here
+  // so the encoder pre-count can size the sample buffer for it. The compute work,
+  // pipelines and total order are unchanged — only the encoder grouping differs.
+  std::vector<std::vector<std::pair<size_t, size_t>>> stage_groups(stages.size());
+  for (size_t k = 0; k < stages.size(); ++k) {
+    stage_groups[k].emplace_back(0, stages[k].handle->impl_->num_commands);
+  }
+  bool split_planned = false;
+  if (chain_gpu_timing_enabled() && !chain_m2_split_spec().empty()) {
+    for (size_t k = 0; k < stages.size(); ++k) {
+      auto sp = chain_parse_split_spec(
+          chain_m2_split_spec(), stages[k].handle->impl_->num_commands);
+      if (sp.valid && sp.stage_index == k && sp.groups.size() >= 2) {
+        stage_groups[k].clear();
+        stage_groups[k].reserve(sp.groups.size());
+        for (auto& g : sp.groups) {
+          stage_groups[k].emplace_back(
+              static_cast<size_t>(g.first), static_cast<size_t>(g.second));
+        }
+        split_planned = true;
+      }
+    }
+  }
+
   // --- GPU stage-boundary timestamp sampling setup (fail-open) ---------------
-  // Pre-count the encoders the loop will emit (1 compute per stage + 1 blit per
-  // stage that has feedback or outgoing handoffs) so the counter sample buffer
-  // can be sized (2 samples/encoder: start + end). If the device does not support
-  // stage-boundary counter sampling, or has no timestamp counter set, or the
-  // sample buffer cannot be created, `sampling` stays false and the loop takes the
-  // exact original encoder path — zero effect on the encoded work.
+  // Pre-count the encoders the loop will emit (1 compute per stage — or one per
+  // split group for a split stage — plus 1 blit per stage that has feedback or
+  // outgoing handoffs) so the counter sample buffer can be sized (2 samples/encoder:
+  // start + end). If the device does not support stage-boundary counter sampling,
+  // or has no timestamp counter set, or the sample buffer cannot be created,
+  // `sampling` stays false and the loop takes the exact original single-encoder
+  // path (no split either) — zero effect on the encoded work.
   size_t num_encoders = 0;
   for (size_t k = 0; k < stages.size(); ++k) {
-    ++num_encoders; // stage compute encoder
+    num_encoders += stage_groups[k].size(); // compute encoder(s) — >1 iff split
     const bool has_fb =
         stages[k].feedback_plan && !stages[k].feedback_plan->blits.empty();
     if (has_fb || !outgoing[k].empty()) {
       ++num_encoders; // stage blit encoder
     }
   }
+  (void)split_planned;
   bool sampling = false;
   if (chain_gpu_timing_enabled()) {
     MTL::CounterSet* ts_set = nullptr;
@@ -1674,21 +1831,34 @@ uint64_t chain_submit(
     const auto& stage = stages[k];
     auto& impl = *stage.handle->impl_;
 
-    // 1. Stage k compute: execute the handle's ICB.
-    auto* enc = sampled_compute();
-    if (sampling) {
-      entry.encoder_tags.push_back({static_cast<uint32_t>(k), false});
-      ++enc_idx;
+    // 1. Stage k compute: execute the handle's ICB. When the W1b split is active
+    //    (sampling engaged AND this stage is split) the ICB range is emitted as
+    //    multiple fenced group sub-encoders, each sampled separately; otherwise
+    //    ONE full-range compute encoder (identical to the pre-split path). The
+    //    fence chain preserves total order across groups — a group sub-encoder
+    //    waits on the previous encoder's fence and updates its own, so the same
+    //    producers-before-consumers guarantee (and thus the same numerics) holds.
+    std::vector<std::pair<size_t, size_t>> full{{0, impl.num_commands}};
+    const std::vector<std::pair<size_t, size_t>>& groups =
+        sampling ? stage_groups[k] : full;
+    for (size_t g = 0; g < groups.size(); ++g) {
+      auto* enc = sampled_compute();
+      if (sampling) {
+        entry.encoder_tags.push_back(
+            {static_cast<uint32_t>(k), false, static_cast<uint32_t>(g)});
+        ++enc_idx;
+      }
+      if (prev_fence) {
+        enc->waitForFence(prev_fence);
+      }
+      chain_use_arena(enc, impl);
+      enc->executeCommandsInBuffer(
+          impl.icb.get(), NS::Range(groups[g].first, groups[g].second));
+      MTL::Fence* compute_fence = fresh_fence();
+      enc->updateFence(compute_fence);
+      enc->endEncoding();
+      prev_fence = compute_fence;
     }
-    if (prev_fence) {
-      enc->waitForFence(prev_fence);
-    }
-    chain_use_arena(enc, impl);
-    enc->executeCommandsInBuffer(impl.icb.get(), NS::Range(0, impl.num_commands));
-    MTL::Fence* compute_fence = fresh_fence();
-    enc->updateFence(compute_fence);
-    enc->endEncoding();
-    prev_fence = compute_fence;
 
     // 2. One blit encoder after stage k for its same-handle feedback + every
     //    cross-handle handoff sourced from stage k. Both read stage k's just-
@@ -1700,7 +1870,7 @@ uint64_t chain_submit(
     if (has_feedback || has_handoffs) {
       auto* blit = sampled_blit();
       if (sampling) {
-        entry.encoder_tags.push_back({static_cast<uint32_t>(k), true});
+        entry.encoder_tags.push_back({static_cast<uint32_t>(k), true, 0u});
         ++enc_idx;
       }
       blit->waitForFence(prev_fence);
@@ -1849,6 +2019,7 @@ std::vector<ChainStageSpanNs> chain_wait(uint64_t ticket) {
     ChainStageSpanNs s;
     s.stage_index = entry.encoder_tags[i].stage_index;
     s.is_blit = entry.encoder_tags[i].is_blit;
+    s.group_index = entry.encoder_tags[i].group_index;
     const uint64_t t0 = ts[2 * i].timestamp;
     const uint64_t t1 = ts[2 * i + 1].timestamp;
     if (t0 == kErr || t1 == kErr || t1 < t0) {

@@ -125,6 +125,10 @@ const std::vector<array>& CaptureReplay::outputs() const {
   static std::vector<array> empty;
   return empty;
 }
+const std::vector<std::string>& CaptureReplay::command_kernel_names() const {
+  static std::vector<std::string> empty;
+  return empty;
+}
 
 // --- S4a chained submit: throwing stubs (no Metal backend) -----------------
 std::shared_ptr<ChainPlan> make_chain_plan(
@@ -158,6 +162,84 @@ double chain_ticks_to_ns(
     return -1.0;
   }
   return static_cast<double>(tick_delta) * ns_per_tick;
+}
+
+// Pure string arithmetic (no Metal state) — real impl even in the no-metal build
+// so the within-stage split parser seam is testable everywhere (report §40). Kept
+// byte-for-byte identical to the metal-backend definition.
+ChainSplitPlan chain_parse_split_spec(
+    const std::string& spec,
+    uint64_t num_commands) {
+  ChainSplitPlan plan;
+  auto colon = spec.find(':');
+  if (colon == std::string::npos) {
+    return plan;
+  }
+  const std::string head = spec.substr(0, colon);
+  const std::string tail = spec.substr(colon + 1);
+  if (head.empty()) {
+    return plan;
+  }
+  uint64_t stage = 0;
+  for (char c : head) {
+    if (c < '0' || c > '9') {
+      return plan;
+    }
+    stage = stage * 10 + static_cast<uint64_t>(c - '0');
+    if (stage > 0xffffffffULL) {
+      return plan;
+    }
+  }
+  std::vector<uint64_t> idx;
+  uint64_t cur = 0;
+  bool any_digit = false;
+  auto flush = [&]() -> bool {
+    if (!any_digit) {
+      return false;
+    }
+    idx.push_back(cur);
+    cur = 0;
+    any_digit = false;
+    return true;
+  };
+  for (char c : tail) {
+    if (c == ',') {
+      if (!flush()) {
+        return plan;
+      }
+    } else if (c >= '0' && c <= '9') {
+      cur = cur * 10 + static_cast<uint64_t>(c - '0');
+      any_digit = true;
+      if (cur > 0xffffffffULL) {
+        return plan;
+      }
+    } else {
+      return plan;
+    }
+  }
+  if (!flush()) {
+    return plan;
+  }
+  if (idx.empty() || num_commands == 0) {
+    return plan;
+  }
+  uint64_t prev = 0;
+  for (uint64_t v : idx) {
+    if (v <= prev || v >= num_commands) {
+      return plan;
+    }
+    prev = v;
+  }
+  plan.groups.reserve(idx.size() + 1);
+  uint64_t start = 0;
+  for (uint64_t v : idx) {
+    plan.groups.emplace_back(start, v - start);
+    start = v;
+  }
+  plan.groups.emplace_back(start, num_commands - start);
+  plan.valid = true;
+  plan.stage_index = static_cast<uint32_t>(stage);
+  return plan;
 }
 
 } // namespace metal

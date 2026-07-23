@@ -233,6 +233,15 @@ class MLX_API CaptureReplay {
   const std::vector<array>& inputs() const;
   const std::vector<array>& outputs() const;
 
+  /** Per-command kernel name (the primary MTL::Function's name), one entry per
+   * ICB command in dispatch order (length == num_commands()). Recorded once at
+   * capture from the retained function registry — cheap, host-side, and never
+   * touched by replay. Empty for a command whose function was not retained (built
+   * before MLX_CAPTURE_REPLAY was set). Used by the W1b within-stage split (report
+   * §40) to build a per-group kernel-name histogram so a split's command-index
+   * group boundaries are auditable against the model's per-layer kernel pattern. */
+  const std::vector<std::string>& command_kernel_names() const;
+
  private:
   explicit CaptureReplay(std::unique_ptr<Impl> impl);
   std::unique_ptr<Impl> impl_;
@@ -312,7 +321,11 @@ struct ChainStage {
  * chain_wait via Metal stage-boundary counter sampling. `stage_index` is the
  * ChainStage (0-based) this encoder belongs to; `is_blit` is false for the
  * stage's compute (executeCommandsInBuffer) encoder and true for its trailing
- * feedback/handoff blit encoder. `duration_ns` is that encoder's GPU-side
+ * feedback/handoff blit encoder. `group_index` is 0 for every un-split encoder;
+ * for a stage split into sub-encoders by the W1b within-stage split (report §40,
+ * MLX_CHAIN_GPU_TIMING_M2_SPLIT) each of that stage's compute sub-encoders carries
+ * its 0-based group index in ICB-command order (0..num_groups-1) so within-stage
+ * attribution is index-aligned. `duration_ns` is that encoder's GPU-side
  * execution time (start-of-encoder→end-of-encoder timestamp delta, resolved to
  * nanoseconds via device CPU/GPU timestamp correlation). `valid` is false when
  * the counter was unavailable for that boundary (duration is then 0). The whole
@@ -323,7 +336,36 @@ struct ChainStageSpanNs {
   bool is_blit = false;
   bool valid = false;
   uint64_t duration_ns = 0;
+  uint32_t group_index = 0;
 };
+
+/** A parsed within-stage split plan (report §40, W1b within-m2 attribution). The
+ * split spec (env MLX_CHAIN_GPU_TIMING_M2_SPLIT) names ONE stage's ICB and a set
+ * of ascending command-index split points; chain_parse_split_spec turns it into
+ * the contiguous group ranges [start,count) over that stage's [0,num_commands)
+ * ICB. `valid` is true only when the spec is well-formed AND every split index is
+ * strictly ascending and strictly inside (0, num_commands) — otherwise it is
+ * false with an empty `groups`, and chain_submit takes the byte-identical
+ * single-encoder path (fail-open). `stage_index` is the ChainStage the split
+ * applies to. Pure string arithmetic (no Metal state) — the same function
+ * chain_submit uses to decide the split, exposed so the controller derives the
+ * EXACT same group boundaries for the report metadata + kernel histogram. */
+struct ChainSplitPlan {
+  bool valid = false;
+  uint32_t stage_index = 0;
+  // Contiguous (start, count) ICB-command ranges covering [0, num_commands).
+  std::vector<std::pair<uint64_t, uint64_t>> groups;
+};
+
+/** Parse a within-stage split spec ("<stage_index>:<i1>,<i2>,..." — ascending
+ * command-index split points) against a stage's `num_commands` into a
+ * ChainSplitPlan (report §40). Fail-open: any malformation, an empty split list,
+ * a non-ascending index, or an index outside (0, num_commands) yields
+ * `valid == false` (no split — byte-identical single-encoder path). No Metal state
+ * touched; safe to unit-test in isolation and identical in the no-metal build. */
+MLX_API ChainSplitPlan chain_parse_split_spec(
+    const std::string& spec,
+    uint64_t num_commands);
 
 /** Pure GPU-tick → nanosecond conversion used by chain_wait's resolution path
  * (report §37.10), exposed for a CPU unit test of the correlation math. Scale =
@@ -360,8 +402,11 @@ MLX_API uint64_t chain_submit(
  * Returns one ChainStageSpanNs per encoder the chain emitted (compute, then its
  * trailing blit if any), in encoder order — the per-stage GPU-time decomposition
  * of the chain's wall (append / its device-feed blits / draft / m2-verify / target
- * + sample). EMPTY unless GPU stage-boundary sampling was BOTH opted in (the env
- * var MLX_CHAIN_GPU_TIMING set to a non-empty, non-"0" value at chain_submit) AND
+ * + sample). When the W1b within-stage split is active (MLX_CHAIN_GPU_TIMING_M2_SPLIT,
+ * report §40) the split stage contributes ONE compute span per group (each tagged
+ * with its group_index) instead of one, giving the within-stage attribution. EMPTY
+ * unless GPU stage-boundary sampling was BOTH opted in (the env var
+ * MLX_CHAIN_GPU_TIMING set to a non-empty, non-"0" value at chain_submit) AND
  * supported by the device (fail-open otherwise). Default (env unset): the chained
  * submit takes the exact original encoder path — byte-identical, zero added cost.
  * The timing is diagnostic and never changes the wait semantics or the decode. */
