@@ -308,6 +308,23 @@ struct ChainStage {
   std::shared_ptr<CaptureReplay::FeedbackPlan> feedback_plan; // or null
 };
 
+/** One GPU-timestamped encoder span from a chained submit, resolved by
+ * chain_wait via Metal stage-boundary counter sampling. `stage_index` is the
+ * ChainStage (0-based) this encoder belongs to; `is_blit` is false for the
+ * stage's compute (executeCommandsInBuffer) encoder and true for its trailing
+ * feedback/handoff blit encoder. `duration_ns` is that encoder's GPU-side
+ * execution time (start-of-encoder→end-of-encoder timestamp delta, resolved to
+ * nanoseconds via device CPU/GPU timestamp correlation). `valid` is false when
+ * the counter was unavailable for that boundary (duration is then 0). The whole
+ * returned vector is EMPTY when GPU counter sampling is unsupported at runtime
+ * (fail-open) — the spans are diagnostic only and never alter execution. */
+struct ChainStageSpanNs {
+  uint32_t stage_index = 0;
+  bool is_blit = false;
+  bool valid = false;
+  uint64_t duration_ns = 0;
+};
+
 /** Encode every stage's ICB (+ its feedback blits) and the cross-handle
  * `handoffs` into ONE command buffer in dependency order (fenced per boundary,
  * see above) and commit WITHOUT waiting; returns an opaque ticket. `stages` must
@@ -322,7 +339,16 @@ MLX_API uint64_t chain_submit(
 /** Block until the chained command buffer for `ticket` completes (the SINGLE
  * per-cycle waitUntilCompleted). Throws on an unknown/already-waited ticket or a
  * command-buffer error. After it returns, read each stage handle's small decision
- * outputs via read_output(); the advancing state was fed on-device by the blits. */
-MLX_API void chain_wait(uint64_t ticket);
+ * outputs via read_output(); the advancing state was fed on-device by the blits.
+ *
+ * Returns one ChainStageSpanNs per encoder the chain emitted (compute, then its
+ * trailing blit if any), in encoder order — the per-stage GPU-time decomposition
+ * of the chain's wall (append / its device-feed blits / draft / m2-verify / target
+ * + sample). EMPTY unless GPU stage-boundary sampling was BOTH opted in (the env
+ * var MLX_CHAIN_GPU_TIMING set to a non-empty, non-"0" value at chain_submit) AND
+ * supported by the device (fail-open otherwise). Default (env unset): the chained
+ * submit takes the exact original encoder path — byte-identical, zero added cost.
+ * The timing is diagnostic and never changes the wait semantics or the decode. */
+MLX_API std::vector<ChainStageSpanNs> chain_wait(uint64_t ticket);
 
 } // namespace mlx::core::metal

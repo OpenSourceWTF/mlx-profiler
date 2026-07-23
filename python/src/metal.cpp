@@ -483,8 +483,21 @@ void init_metal(nb::module_& m) {
   metal.def(
       "chain_wait",
       [](uint64_t ticket) {
-        nb::gil_scoped_release nogil;
-        mx::metal::chain_wait(ticket);
+        std::vector<mx::metal::ChainStageSpanNs> spans;
+        {
+          nb::gil_scoped_release nogil;
+          spans = mx::metal::chain_wait(ticket);
+        }
+        nb::list out;
+        for (const auto& s : spans) {
+          nb::dict d;
+          d["stage_index"] = s.stage_index;
+          d["is_blit"] = s.is_blit;
+          d["duration_ns"] = s.duration_ns;
+          d["valid"] = s.valid;
+          out.append(d);
+        }
+        return out;
       },
       "ticket"_a,
       R"pbdoc(
@@ -492,5 +505,13 @@ void init_metal(nb::module_& m) {
       per-cycle wait). After it returns, read the small decision outputs from the
       stage handles' :meth:`CaptureReplay.read_output`; the advancing decode state
       was fed on-device by the feedback / handoff blits.
+
+      Returns a list of per-encoder GPU stage-boundary spans (one dict per encoder
+      the chain emitted, in encoder order): ``{"stage_index": int, "is_blit": bool,
+      "duration_ns": int, "valid": bool}``. ``stage_index`` indexes the ``stages``
+      passed to :func:`chain_submit` (append/draft/m2/target); ``is_blit`` is False
+      for the stage's ICB compute encoder and True for its trailing feedback/handoff
+      blit encoder. The list is EMPTY when GPU counter sampling is unavailable at
+      runtime (fail-open) — the timing is diagnostic and never affects the decode.
       )pbdoc");
 }

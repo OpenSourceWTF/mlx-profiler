@@ -139,7 +139,7 @@ uint64_t chain_submit(
     const std::vector<std::shared_ptr<ChainPlan>>&) {
   throw std::runtime_error("[chain_submit] No Metal back-end.");
 }
-void chain_wait(uint64_t) {
+std::vector<ChainStageSpanNs> chain_wait(uint64_t) {
   throw std::runtime_error("[chain_wait] No Metal back-end.");
 }
 

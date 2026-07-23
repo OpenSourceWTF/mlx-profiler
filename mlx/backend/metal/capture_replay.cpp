@@ -99,6 +99,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include <mach/mach_time.h>
+
 namespace mlx::core::metal {
 
 namespace capture {
@@ -1315,6 +1317,13 @@ namespace {
 // fences, and the stage handles it references are all owned HERE (not by any one
 // handle) and released only when chain_wait completes. One chained CB in flight at
 // a time (serial-use), guarded by g_chain_mtx.
+// Which chain encoder a pair of counter-sample slots belongs to. Sample slots
+// 2*i (start) / 2*i+1 (end) time encoder i; the tag maps i back to its stage and
+// whether it is the stage's compute (ICB) encoder or its trailing blit encoder.
+struct ChainEncoderTag {
+  uint32_t stage_index;
+  bool is_blit;
+};
 struct ChainInflight {
   NS::SharedPtr<MTL::CommandBuffer> cb;
   // One MTLFence per encoder boundary (§12: a FRESH fence per boundary, never a
@@ -1323,11 +1332,55 @@ struct ChainInflight {
   // Pin the stage handles so their pinned arenas / ICBs cannot be freed between
   // chain_submit and chain_wait even if the caller drops its references.
   std::vector<std::shared_ptr<CaptureReplay>> handles;
+  // --- GPU stage-boundary timestamp sampling (fail-open, W1 report §37) ------
+  // Populated only when the device supports stage-boundary counter sampling AND
+  // the sample buffer was created; otherwise sampling=false and chain_wait returns
+  // an empty span vector (zero effect on execution). The sample buffer is kept
+  // alive here until chain_wait resolves it after waitUntilCompleted.
+  NS::SharedPtr<MTL::CounterSampleBuffer> sample_buffer;
+  std::vector<ChainEncoderTag> encoder_tags; // encoder i -> slots [2i, 2i+1]
+  uint64_t cpu_pre = 0; // mach_absolute_time-domain correlation point at submit
+  uint64_t gpu_pre = 0; // GPU-timebase correlation point at submit
+  bool sampling = false;
 };
 std::mutex g_chain_mtx;
 NS::SharedPtr<MTL::CommandQueue> g_chain_queue;
 std::unordered_map<uint64_t, ChainInflight> g_chain_inflight;
 uint64_t g_chain_next_ticket = 1;
+
+// Opt-in gate for the W1 GPU stage-boundary timing path (report §37). Read ONCE
+// from MLX_CHAIN_GPU_TIMING (any non-empty value other than "0"). Default OFF: the
+// chained submit then takes the exact original encoder path (byte-identical, zero
+// added cost) — so no existing chained window is perturbed; the W1 smoke window
+// sets the env to turn per-stage sampling on. Never changes execution semantics
+// either way (sampling only attaches counter timestamps to the same encoders).
+bool chain_gpu_timing_enabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("MLX_CHAIN_GPU_TIMING");
+    return v != nullptr && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
+  }();
+  return on;
+}
+
+// The device's timestamp MTLCounterSet (nullptr if it has none). Cheap linear
+// scan over counterSets(); only called when stage-boundary sampling is supported.
+MTL::CounterSet* timestamp_counter_set(MTL::Device* dev) {
+  auto* sets = dev->counterSets();
+  if (!sets) {
+    return nullptr;
+  }
+  const char* want = MTL::CommonCounterSetTimestamp
+      ? MTL::CommonCounterSetTimestamp->utf8String()
+      : "timestamp";
+  for (NS::UInteger i = 0; i < sets->count(); ++i) {
+    auto* cs = static_cast<MTL::CounterSet*>(sets->object(i));
+    if (cs && cs->name() && cs->name()->utf8String() && want &&
+        std::strcmp(cs->name()->utf8String(), want) == 0) {
+      return cs;
+    }
+  }
+  return nullptr;
+}
 
 // Address-stability + bounds guard for one leaf a chain blit touches: the captured
 // buffer must not have moved (allocator reuse) and offset()+nbytes must fit its
@@ -1537,6 +1590,75 @@ uint64_t chain_submit(
 
   auto* cb = g_chain_queue->commandBuffer();
 
+  // --- GPU stage-boundary timestamp sampling setup (fail-open) ---------------
+  // Pre-count the encoders the loop will emit (1 compute per stage + 1 blit per
+  // stage that has feedback or outgoing handoffs) so the counter sample buffer
+  // can be sized (2 samples/encoder: start + end). If the device does not support
+  // stage-boundary counter sampling, or has no timestamp counter set, or the
+  // sample buffer cannot be created, `sampling` stays false and the loop takes the
+  // exact original encoder path — zero effect on the encoded work.
+  size_t num_encoders = 0;
+  for (size_t k = 0; k < stages.size(); ++k) {
+    ++num_encoders; // stage compute encoder
+    const bool has_fb =
+        stages[k].feedback_plan && !stages[k].feedback_plan->blits.empty();
+    if (has_fb || !outgoing[k].empty()) {
+      ++num_encoders; // stage blit encoder
+    }
+  }
+  bool sampling = false;
+  if (chain_gpu_timing_enabled()) {
+    MTL::CounterSet* ts_set = nullptr;
+    if (num_encoders > 0 &&
+        mtl_device->supportsCounterSampling(
+            MTL::CounterSamplingPointAtStageBoundary) &&
+        (ts_set = timestamp_counter_set(mtl_device)) != nullptr) {
+      auto* desc = MTL::CounterSampleBufferDescriptor::alloc()->init();
+      desc->setCounterSet(ts_set);
+      desc->setStorageMode(MTL::StorageModeShared);
+      desc->setSampleCount(static_cast<NS::UInteger>(2 * num_encoders));
+      NS::Error* err = nullptr;
+      auto* sb = mtl_device->newCounterSampleBuffer(desc, &err);
+      desc->release();
+      if (sb && err == nullptr) {
+        entry.sample_buffer = NS::TransferPtr(sb);
+        entry.encoder_tags.reserve(num_encoders);
+        sampling = true;
+      } else if (sb) {
+        sb->release();
+      }
+    }
+  }
+
+  // Attach the timestamp sample buffer to an encoder's stage boundaries via a pass
+  // descriptor (compute keeps DispatchTypeConcurrent, identical to the non-sampled
+  // path). Records the encoder's tag so chain_wait can map sample slots back to
+  // stage/kind. No-op (returns the encoder unmodified) when sampling is off.
+  size_t enc_idx = 0;
+  auto sampled_compute = [&]() -> MTL::ComputeCommandEncoder* {
+    if (!sampling) {
+      return cb->computeCommandEncoder(MTL::DispatchTypeConcurrent);
+    }
+    auto* cpd = MTL::ComputePassDescriptor::computePassDescriptor();
+    cpd->setDispatchType(MTL::DispatchTypeConcurrent);
+    auto* att = cpd->sampleBufferAttachments()->object(0);
+    att->setSampleBuffer(entry.sample_buffer.get());
+    att->setStartOfEncoderSampleIndex(static_cast<NS::UInteger>(2 * enc_idx));
+    att->setEndOfEncoderSampleIndex(static_cast<NS::UInteger>(2 * enc_idx + 1));
+    return cb->computeCommandEncoder(cpd);
+  };
+  auto sampled_blit = [&]() -> MTL::BlitCommandEncoder* {
+    if (!sampling) {
+      return cb->blitCommandEncoder();
+    }
+    auto* bpd = MTL::BlitPassDescriptor::blitPassDescriptor();
+    auto* att = bpd->sampleBufferAttachments()->object(0);
+    att->setSampleBuffer(entry.sample_buffer.get());
+    att->setStartOfEncoderSampleIndex(static_cast<NS::UInteger>(2 * enc_idx));
+    att->setEndOfEncoderSampleIndex(static_cast<NS::UInteger>(2 * enc_idx + 1));
+    return cb->blitCommandEncoder(bpd);
+  };
+
   // Linear fence chain: every encoder (compute or blit) waits on the previous
   // encoder's fresh fence and updates its own. Total order => producers-before-
   // consumers is sufficient for correctness with hazard-untracked buffers.
@@ -1553,7 +1675,11 @@ uint64_t chain_submit(
     auto& impl = *stage.handle->impl_;
 
     // 1. Stage k compute: execute the handle's ICB.
-    auto* enc = cb->computeCommandEncoder(MTL::DispatchTypeConcurrent);
+    auto* enc = sampled_compute();
+    if (sampling) {
+      entry.encoder_tags.push_back({static_cast<uint32_t>(k), false});
+      ++enc_idx;
+    }
     if (prev_fence) {
       enc->waitForFence(prev_fence);
     }
@@ -1572,7 +1698,11 @@ uint64_t chain_submit(
         stage.feedback_plan && !stage.feedback_plan->blits.empty();
     const bool has_handoffs = !outgoing[k].empty();
     if (has_feedback || has_handoffs) {
-      auto* blit = cb->blitCommandEncoder();
+      auto* blit = sampled_blit();
+      if (sampling) {
+        entry.encoder_tags.push_back({static_cast<uint32_t>(k), true});
+        ++enc_idx;
+      }
       blit->waitForFence(prev_fence);
       if (has_feedback) {
         for (const auto& b : stage.feedback_plan->blits) {
@@ -1595,6 +1725,18 @@ uint64_t chain_submit(
     }
   }
 
+  // Correlation point #1 (submit side): sample the device's CPU/GPU timestamp
+  // pair so chain_wait can convert the GPU-timebase stage-boundary ticks into
+  // nanoseconds. Only the SLOPE across this point and the post-wait point matters
+  // for durations, so bracketing commit..completion is sufficient.
+  if (sampling) {
+    entry.sampling = true;
+    MTL::Timestamp cpu_pre = 0, gpu_pre = 0;
+    mtl_device->sampleTimestamps(&cpu_pre, &gpu_pre);
+    entry.cpu_pre = static_cast<uint64_t>(cpu_pre);
+    entry.gpu_pre = static_cast<uint64_t>(gpu_pre);
+  }
+
   cb->commit();
 
   uint64_t ticket = g_chain_next_ticket++;
@@ -1603,7 +1745,7 @@ uint64_t chain_submit(
   return ticket;
 }
 
-void chain_wait(uint64_t ticket) {
+std::vector<ChainStageSpanNs> chain_wait(uint64_t ticket) {
   auto pool = metal::new_scoped_memory_pool();
   // Move the whole entry out (cb + fences + handle pins) so everything the GPU is
   // still using stays alive across waitUntilCompleted, then drops after it returns.
@@ -1627,6 +1769,71 @@ void chain_wait(uint64_t ticket) {
     throw std::runtime_error(
         "[chain_wait] Chained command buffer failed: " + emsg);
   }
+
+  // --- Resolve the per-encoder GPU stage-boundary spans (fail-open) ----------
+  // Any missing piece (sampling off, correlation invalid, resolve failure, or a
+  // per-boundary error value) degrades to an empty / partial vector — never a
+  // throw, never a change to the wait semantics above.
+  std::vector<ChainStageSpanNs> spans;
+  if (!entry.sampling || !entry.sample_buffer || entry.encoder_tags.empty()) {
+    return spans;
+  }
+
+  auto& d = metal::device(mlx::core::Device::gpu);
+  auto* mtl_device = d.mtl_device();
+
+  // Correlation point #2 (completion side); slope over pre->post maps GPU ticks
+  // to CPU nanoseconds. mach_absolute_time ticks -> ns via the cached timebase.
+  MTL::Timestamp cpu_post = 0, gpu_post = 0;
+  mtl_device->sampleTimestamps(&cpu_post, &gpu_post);
+  static const mach_timebase_info_data_t tb = [] {
+    mach_timebase_info_data_t t{};
+    mach_timebase_info(&t);
+    return t;
+  }();
+  if (static_cast<uint64_t>(gpu_post) <= entry.gpu_pre ||
+      static_cast<uint64_t>(cpu_post) <= entry.cpu_pre || tb.denom == 0) {
+    return spans;
+  }
+  const double cpu_delta_ns =
+      static_cast<double>(static_cast<uint64_t>(cpu_post) - entry.cpu_pre) *
+      static_cast<double>(tb.numer) / static_cast<double>(tb.denom);
+  const double gpu_delta =
+      static_cast<double>(static_cast<uint64_t>(gpu_post) - entry.gpu_pre);
+  if (gpu_delta <= 0.0 || cpu_delta_ns <= 0.0) {
+    return spans;
+  }
+  const double ns_per_tick = cpu_delta_ns / gpu_delta;
+
+  const NS::UInteger n_slots =
+      static_cast<NS::UInteger>(entry.encoder_tags.size() * 2);
+  NS::Data* data = entry.sample_buffer->resolveCounterRange(NS::Range(0, n_slots));
+  if (!data || !data->mutableBytes() ||
+      data->length() <
+          n_slots * sizeof(MTL::CounterResultTimestamp)) {
+    return spans;
+  }
+  const auto* ts =
+      static_cast<const MTL::CounterResultTimestamp*>(data->mutableBytes());
+  const uint64_t kErr = static_cast<uint64_t>(MTL::CounterErrorValue);
+  spans.reserve(entry.encoder_tags.size());
+  for (size_t i = 0; i < entry.encoder_tags.size(); ++i) {
+    ChainStageSpanNs s;
+    s.stage_index = entry.encoder_tags[i].stage_index;
+    s.is_blit = entry.encoder_tags[i].is_blit;
+    const uint64_t t0 = ts[2 * i].timestamp;
+    const uint64_t t1 = ts[2 * i + 1].timestamp;
+    if (t0 == kErr || t1 == kErr || t1 < t0) {
+      s.valid = false;
+      s.duration_ns = 0;
+    } else {
+      s.valid = true;
+      s.duration_ns =
+          static_cast<uint64_t>(static_cast<double>(t1 - t0) * ns_per_tick + 0.5);
+    }
+    spans.push_back(s);
+  }
+  return spans;
 }
 
 } // namespace mlx::core::metal
