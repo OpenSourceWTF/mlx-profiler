@@ -54,6 +54,8 @@ set(CENSUS_PIPELINE
     ${CMAKE_CURRENT_BINARY_DIR}/dispatch-census-pipeline-persistence.jsonl)
 set(CENSUS_REREGISTER
     ${CMAKE_CURRENT_BINARY_DIR}/dispatch-census-kernel-reregister.jsonl)
+set(CENSUS_UNREGISTER
+    ${CMAKE_CURRENT_BINARY_DIR}/dispatch-census-kernel-unregister.jsonl)
 set(CENSUS_INVALID
     ${CMAKE_CURRENT_BINARY_DIR}/missing-census-dir/census.jsonl)
 set(CENSUS_SNAPSHOT
@@ -88,6 +90,11 @@ add_test(
           $<TARGET_FILE:dispatch_census_smoke> kernel_reregister
           ${CENSUS_REREGISTER})
 add_test(
+  NAME dispatch_census_kernel_unregister
+  COMMAND ${CMAKE_COMMAND} -E env MLX_DISPATCH_CENSUS=${CENSUS_UNREGISTER}
+          $<TARGET_FILE:dispatch_census_smoke> kernel_unregister
+          ${CENSUS_UNREGISTER})
+add_test(
   NAME dispatch_census_portable_clock
   COMMAND
     ${CMAKE_COMMAND}
@@ -109,10 +116,25 @@ add_test(
 if(APPLE)
   set(CENSUS_FIFO ${CMAKE_CURRENT_BINARY_DIR}/dispatch-census-sink.fifo)
   add_test(
-    NAME dispatch_census_nonblocking_sink
+    NAME dispatch_census_regular_file_required
     COMMAND ${CMAKE_COMMAND} -E env MLX_DISPATCH_CENSUS=${CENSUS_FIFO}
-            $<TARGET_FILE:dispatch_census_smoke> nonblocking_sink
+            $<TARGET_FILE:dispatch_census_smoke> unsupported_sink
             ${CENSUS_FIFO})
+
+  add_executable(
+    dispatch_census_queue_smoke dispatch_census_queue_smoke.cpp
+                                ../mlx/backend/common/dispatch_census.cpp)
+  target_include_directories(dispatch_census_queue_smoke
+                             PRIVATE ${PROJECT_SOURCE_DIR})
+  target_compile_definitions(dispatch_census_queue_smoke
+                             PRIVATE MLX_DISPATCH_CENSUS_TESTING)
+  set(CENSUS_BOUNDED_QUEUE
+      ${CMAKE_CURRENT_BINARY_DIR}/dispatch-census-bounded-queue.jsonl)
+  add_test(
+    NAME dispatch_census_bounded_queue
+    COMMAND
+      ${CMAKE_COMMAND} -E env MLX_DISPATCH_CENSUS=${CENSUS_BOUNDED_QUEUE}
+      $<TARGET_FILE:dispatch_census_queue_smoke> ${CENSUS_BOUNDED_QUEUE})
   add_test(
     NAME clt_preamble_excludes_stub_headers
     COMMAND

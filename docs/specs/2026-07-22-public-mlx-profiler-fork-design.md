@@ -80,7 +80,9 @@ The initial public fork preserves the existing contract:
 - `MLX_DISPATCH_CENSUS` unset: census instrumentation is disabled and behavior
   remains equivalent to official MLX.
 - `MLX_DISPATCH_CENSUS=<path>`: the native MLX backend emits JSONL operation,
-  command-buffer, wait, and summary records for diagnostic use.
+  command-buffer, wait, and summary records for diagnostic use. The sink is a
+  regular file and the asynchronous queue is bounded; overflow is surfaced as
+  an incomplete trace instead of unbounded profiler memory growth.
 - `MLX_MAX_ACTIVE_TASKS` remains diagnostics-only, with the official default of
   `10` unchanged when the environment variable is absent.
 - Instrumentation must not add GPU synchronization to the queued execution lane.

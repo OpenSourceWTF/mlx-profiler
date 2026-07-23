@@ -1,6 +1,4 @@
 #include <atomic>
-#include <cerrno>
-#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -77,7 +75,7 @@ int main(int argc, char** argv) {
     return 0;
   }
 #if !defined(_WIN32)
-  if (mode == "nonblocking_sink") {
+  if (mode == "unsupported_sink") {
     if (mkfifo(path.c_str(), 0600) != 0) {
       return fail("failed to create census sink FIFO");
     }
@@ -85,50 +83,16 @@ int main(int argc, char** argv) {
     if (reader < 0) {
       return fail("failed to open census sink FIFO reader");
     }
-    census::initialize();
-
-    std::atomic<bool> producer_done{false};
-    std::thread producer([&] {
-      constexpr const char* bucket =
-          "blocked_sink_payload_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-      for (int i = 0; i < 5000; ++i) {
-        census::note_wait(bucket, 1000);
-      }
-      producer_done.store(true, std::memory_order_release);
-    });
-
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
-    while (!producer_done.load(std::memory_order_acquire) &&
-           std::chrono::steady_clock::now() < deadline) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    bool rejected = false;
+    try {
+      census::initialize();
+    } catch (const std::runtime_error& error) {
+      rejected = std::string(error.what()).find("regular file") !=
+          std::string::npos;
     }
-    const bool producer_blocked =
-        !producer_done.load(std::memory_order_acquire);
-
-    std::atomic<bool> stop_reader{false};
-    std::thread drain([&] {
-      char buffer[4096];
-      while (!stop_reader.load(std::memory_order_acquire)) {
-        const ssize_t count = read(reader, buffer, sizeof(buffer));
-        if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-          break;
-        }
-        if (count <= 0) {
-          std::this_thread::yield();
-        }
-      }
-    });
-
-    producer.join();
-    census::finalize();
-    stop_reader.store(true, std::memory_order_release);
-    drain.join();
     close(reader);
     std::filesystem::remove(path);
-    return producer_blocked
-        ? fail("census producer blocked on sink I/O")
-        : 0;
+    return rejected ? 0 : fail("census accepted a non-regular output sink");
   }
 #endif
 
@@ -225,6 +189,24 @@ int main(int argc, char** argv) {
     return jsonl.find("\"kernel_name\":\"replacement_kernel\"") ==
             std::string::npos
         ? fail("re-registered pipeline retained its stale name")
+        : 0;
+  }
+  if (mode == "kernel_unregister") {
+    census::CommandBufferState state;
+    const void* pipeline = reinterpret_cast<const void*>(uintptr_t{6});
+    census::register_kernel(pipeline, "released_kernel");
+    census::unregister_kernel(pipeline);
+    census::note_pipeline(state, pipeline);
+    census::note_dispatch(
+        state, "threads", census::Dim3{8, 1, 1}, census::Dim3{4, 1, 1});
+    census::flush();
+
+    std::ifstream input(path);
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    const std::string jsonl = buffer.str();
+    return jsonl.find("\"kernel_name\":\"<unknown>\"") == std::string::npos
+        ? fail("released pipeline retained its census registry entry")
         : 0;
   }
   if (mode == "finalize") {

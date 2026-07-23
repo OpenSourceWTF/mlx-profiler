@@ -865,7 +865,16 @@ MTL::Library* Device::get_library(
 void Device::clear_library(const std::string& name) {
   std::unique_lock wlock(library_mtx_);
   if (auto it = library_map_.find(name); it != library_map_.end()) {
-    library_kernels_.erase(it->second.get());
+    std::unique_lock kernel_lock(kernel_mtx_);
+    if (auto kernels = library_kernels_.find(it->second.get());
+        kernels != library_kernels_.end()) {
+      if (census::enabled()) {
+        for (const auto& [_, pipeline] : kernels->second) {
+          census::unregister_kernel(pipeline.get());
+        }
+      }
+      library_kernels_.erase(kernels);
+    }
     library_map_.erase(it);
   }
 }

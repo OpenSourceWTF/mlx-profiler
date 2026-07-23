@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #if defined(__APPLE__)
@@ -32,6 +33,9 @@ static std::string init_path() {
 const std::string& g_path = *new std::string(init_path());
 // Initialised at static-init, before any Metal command is encoded.
 bool g_enabled = !g_path.empty();
+#if defined(MLX_DISPATCH_CENSUS_TESTING)
+std::atomic<bool> g_writer_paused{false};
+#endif
 
 } // namespace detail
 
@@ -39,6 +43,13 @@ bool g_enabled = !g_path.empty();
 // still accumulate into the per-bucket totals but do not flood the JSONL.
 static constexpr uint64_t kWaitEmitFloorNs = 250;
 static constexpr const char* kSchemaPrefix = "{\"schema_version\":1,";
+#if defined(MLX_DISPATCH_CENSUS_TESTING)
+static constexpr std::size_t kMaxQueuedLines = 4;
+#else
+// Preserve a useful burst without allowing a stalled filesystem to consume
+// unbounded process memory. Overflow is explicit in every later summary.
+static constexpr std::size_t kMaxQueuedLines = 65536;
+#endif
 
 int parse_max_active_tasks(const char* value) {
   if (value != nullptr && value[0] != '\0') {
@@ -98,9 +109,11 @@ struct CensusState {
   std::mutex queue_mtx;
   std::condition_variable queue_cv;
   std::condition_variable drained_cv;
+  std::condition_variable queue_space_cv;
   std::deque<QueuedLine> lines;
   uint64_t next_line_id = 0;
   uint64_t written_line_id = 0;
+  std::atomic<uint64_t> dropped_rows{0};
   bool writer_stop = false;
   std::thread writer;
 
@@ -176,13 +189,22 @@ void writer_loop(CensusState& state) {
     {
       std::unique_lock<std::mutex> lk(state.queue_mtx);
       state.queue_cv.wait(
-          lk, [&state] { return state.writer_stop || !state.lines.empty(); });
+          lk, [&state] {
+#if defined(MLX_DISPATCH_CENSUS_TESTING)
+            const bool paused =
+                detail::g_writer_paused.load(std::memory_order_acquire);
+#else
+            constexpr bool paused = false;
+#endif
+            return state.writer_stop || (!paused && !state.lines.empty());
+          });
       if (state.lines.empty() && state.writer_stop) {
         return;
       }
       line = std::move(state.lines.front());
       state.lines.pop_front();
     }
+    state.queue_space_cv.notify_all();
     {
       std::lock_guard<std::mutex> lk(state.file_mtx);
       state.file << line.text;
@@ -196,11 +218,25 @@ void writer_loop(CensusState& state) {
 }
 
 void initialize_file(CensusState& state) {
+  std::error_code ec;
+  if (std::filesystem::exists(detail::g_path, ec) &&
+      !std::filesystem::is_regular_file(detail::g_path, ec)) {
+    throw std::runtime_error(
+        "MLX_DISPATCH_CENSUS output must be a regular file: " +
+        detail::g_path);
+  }
   state.file.open(detail::g_path, std::ios::out | std::ios::trunc);
   state.file_opened = state.file.is_open();
   if (!state.file_opened) {
     throw std::runtime_error(
         "MLX_DISPATCH_CENSUS cannot open output path: " + detail::g_path);
+  }
+  if (!std::filesystem::is_regular_file(detail::g_path, ec)) {
+    state.file.close();
+    state.file_opened = false;
+    throw std::runtime_error(
+        "MLX_DISPATCH_CENSUS output must be a regular file: " +
+        detail::g_path);
   }
   state.writer = std::thread([&state] { writer_loop(state); });
 }
@@ -239,10 +275,17 @@ void append_json_string(std::string& out, const std::string& value) {
 }
 
 // Queue one complete JSONL line. Only the dedicated writer touches the sink.
-uint64_t write_line(CensusState& state, std::string line) {
+uint64_t write_line(CensusState& state, std::string line, bool barrier = false) {
   uint64_t id;
   {
-    std::lock_guard<std::mutex> lk(state.queue_mtx);
+    std::unique_lock<std::mutex> lk(state.queue_mtx);
+    if (barrier) {
+      state.queue_space_cv.wait(
+          lk, [&state] { return state.lines.size() < kMaxQueuedLines; });
+    } else if (state.lines.size() >= kMaxQueuedLines) {
+      state.dropped_rows.fetch_add(1, std::memory_order_relaxed);
+      return 0;
+    }
     id = ++state.next_line_id;
     state.lines.push_back(QueuedLine{id, std::move(line)});
   }
@@ -288,6 +331,11 @@ uint64_t write_summary(CensusState& state, bool final) {
   line += std::to_string(state.seq.load(std::memory_order_relaxed));
   line += ",\"cbs_total\":";
   line += std::to_string(state.cb_counter.load(std::memory_order_relaxed));
+  const uint64_t dropped =
+      state.dropped_rows.load(std::memory_order_relaxed);
+  line += ",\"dropped_rows\":" + std::to_string(dropped);
+  line += ",\"complete\":";
+  line += dropped == 0 ? "true" : "false";
   line += ",\"buckets\":{";
   {
     std::lock_guard<std::mutex> lk(state.bucket_mtx);
@@ -303,7 +351,7 @@ uint64_t write_summary(CensusState& state, bool final) {
     }
   }
   line += "}}\n";
-  return write_line(state, std::move(line));
+  return write_line(state, std::move(line), true);
 }
 
 // Close the sink on process teardown without destroying callback-visible state.
@@ -316,6 +364,13 @@ struct Closer {
 Closer g_closer;
 
 } // namespace
+
+#if defined(MLX_DISPATCH_CENSUS_TESTING)
+void detail::set_writer_paused_for_test(bool paused) {
+  g_writer_paused.store(paused, std::memory_order_release);
+  global_state().queue_cv.notify_all();
+}
+#endif
 
 void initialize() {
   if (!detail::g_enabled) {
@@ -367,6 +422,16 @@ void register_kernel(const void* pipeline, const char* name) {
   auto& global = guard.state();
   std::lock_guard<std::mutex> lk(global.name_mtx);
   global.names.insert_or_assign(pipeline, std::string(name));
+}
+
+void unregister_kernel(const void* pipeline) {
+  ProducerGuard guard;
+  if (!guard || pipeline == nullptr) {
+    return;
+  }
+  auto& global = guard.state();
+  std::lock_guard<std::mutex> lk(global.name_mtx);
+  global.names.erase(pipeline);
 }
 
 void note_pipeline(CommandBufferState& state, const void* pipeline) {

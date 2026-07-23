@@ -57,6 +57,10 @@ struct CommandBufferState {
 namespace detail {
 // Defined in dispatch_census.cpp; initialised at static-init from getenv.
 extern bool g_enabled;
+#if defined(MLX_DISPATCH_CENSUS_TESTING)
+// Deterministic queue-backpressure control for the standalone smoke target.
+void set_writer_paused_for_test(bool paused);
+#endif
 } // namespace detail
 
 // True iff MLX_DISPATCH_CENSUS is set to a non-empty path. Cheap, inlined.
@@ -64,8 +68,8 @@ inline bool enabled() {
   return detail::g_enabled;
 }
 
-// Open and validate the configured sink before entering the measured lane.
-// Throws once with a clear diagnostic if the configured path is unusable.
+// Open and validate the configured regular-file sink before entering the
+// measured lane. Throws once with a clear diagnostic if the path is unusable.
 void initialize();
 
 // Stop accepting records, wait for in-flight producers, emit one final summary,
@@ -87,6 +91,8 @@ uint64_t now_ns();
 // Register a compute-pipeline pointer -> kernel name (called once per kernel at
 // pipeline-state creation) so note_dispatch can resolve the bound pipeline.
 void register_kernel(const void* pipeline, const char* name);
+// Remove a released pipeline from the diagnostic name registry.
+void unregister_kernel(const void* pipeline);
 
 // Per-dispatch accumulation. Command boundary: bind pipeline, set arguments
 // (setBytes + buffers), then dispatch. note_dispatch emits the "op" line and
@@ -119,7 +125,8 @@ void note_cb_gpu_times(uint64_t cb_index, double gpu_start_ns, double gpu_end_ns
 // accumulates a per-bucket total dumped at flush.
 void note_wait(const char* bucket, uint64_t wait_ns);
 
-// Emit a non-final summary snapshot and flush queued rows to the sink.
+// Emit a best-effort non-final live snapshot and flush through that row. The
+// terminal finalize() snapshot is coherent because it first closes producers.
 void flush();
 
 } // namespace mlx::core::census

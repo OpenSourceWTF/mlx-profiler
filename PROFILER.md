@@ -17,8 +17,14 @@ during initialization:
 
 ```bash
 MLX_DISPATCH_CENSUS=/absolute/path/census.jsonl \
-  python your_workload.py
+  python3 your_workload.py
 ```
+
+The destination must be a regular file, not a pipe, socket, or device. The
+asynchronous queue is bounded at 65,536 rows: if the filesystem cannot keep up,
+later summaries report `dropped_rows` and set `complete:false` instead of
+allowing profiler memory to grow without bound. Treat such a trace as invalid
+evidence and rerun it on a faster local volume.
 
 When the variable is absent or empty, the sink does not create an output file.
 The disabled path performs only a cached flag check at each hook; it creates no
@@ -37,9 +43,9 @@ contains these record types:
   wait. Waits below 250 ns remain in the summary totals without emitting an
   individual row.
 - `summary`: total operations, command buffers, and counts and durations by
-  wait bucket. Synchronization emits a numbered `final:false` snapshot; process
-  teardown emits one terminal `final:true` snapshot without forcing a GPU
-  drain.
+  wait bucket, plus trace completeness. Synchronization emits a numbered,
+  best-effort `final:false` live snapshot; process teardown emits one coherent
+  terminal `final:true` snapshot without forcing a GPU drain.
 
 `MLX_MAX_ACTIVE_TASKS` optionally changes the asynchronous evaluation task cap
 for diagnostics. Its upstream-compatible default remains `10`; valid values are
@@ -61,6 +67,7 @@ Metal/SDK/build-setting mismatches.
 ```bash
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   cmake -S . -B build/native-metallib \
+    -DCMAKE_BUILD_TYPE=Release \
     -DMLX_BUILD_TESTS=OFF \
     -DMLX_BUILD_EXAMPLES=OFF \
     -DMLX_BUILD_PYTHON_BINDINGS=OFF
@@ -79,7 +86,7 @@ cmake -S . -B build/cr \
   -DMLX_METAL_PREBUILT_LIB="$PWD/build/native-metallib/mlx/backend/metal/kernels/mlx.metallib"
 
 cmake --build build/cr --target install
-PYTHONPATH="$PWD/python" python -c \
+PYTHONPATH="$PWD/python" python3 -c \
   'import mlx.core as mx; print(mx.__version__, mx.__file__)'
 ```
 
@@ -89,8 +96,9 @@ contains both `mlx.metallib` and its verified manifest.
 
 ## CPU contract tests
 
-The disabled/enabled sink behavior, baseline JSONL fields, and diagnostic cap
-parser can be checked without reserving a GPU benchmark window:
+The disabled/enabled sink behavior, bounded queue, pipeline-name lifecycle,
+baseline JSONL fields, and diagnostic cap parser can be checked without
+reserving a GPU benchmark window:
 
 ```bash
 cmake -S . -B build/census-cpu \
@@ -98,9 +106,10 @@ cmake -S . -B build/census-cpu \
   -DMLX_BUILD_PYTHON_BINDINGS=OFF \
   -DMLX_BUILD_EXAMPLES=OFF \
   -DMLX_BUILD_TESTS=ON
-cmake --build build/census-cpu --target dispatch_census_smoke
+cmake --build build/census-cpu \
+  --target dispatch_census_smoke dispatch_census_queue_smoke
 ctest --test-dir build/census-cpu --output-on-failure \
-  -R '^dispatch_census_(disabled|enabled)$'
+  -R '^dispatch_census_'
 ```
 
 ## Synchronize official MLX
