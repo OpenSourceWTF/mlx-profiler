@@ -1745,6 +1745,27 @@ uint64_t chain_submit(
   return ticket;
 }
 
+double chain_ticks_to_ns(
+    uint64_t tick_delta,
+    double cpu_delta_ns,
+    double gpu_delta_ticks,
+    double fallback_ns_per_tick) {
+  double ns_per_tick;
+  if (gpu_delta_ticks > 0.0 && cpu_delta_ns > 0.0) {
+    // Two-point CPU/GPU correlation. sampleTimestamps' CPU value is already ns, so
+    // the slope IS ns-per-tick (do NOT multiply by the mach timebase again — the
+    // §37.10 defect). On Apple Silicon this evaluates to ~125/3 by construction.
+    ns_per_tick = cpu_delta_ns / gpu_delta_ticks;
+  } else if (gpu_delta_ticks == 0.0 && fallback_ns_per_tick > 0.0) {
+    // Degenerate correlation (the two GPU samples did not separate): fall back to
+    // the static mach timebase — the GPU timestamp counter is in mach ticks.
+    ns_per_tick = fallback_ns_per_tick;
+  } else {
+    return -1.0; // no usable scale -> caller yields no spans (fail-open)
+  }
+  return static_cast<double>(tick_delta) * ns_per_tick;
+}
+
 std::vector<ChainStageSpanNs> chain_wait(uint64_t ticket) {
   auto pool = metal::new_scoped_memory_pool();
   // Move the whole entry out (cb + fences + handle pins) so everything the GPU is
@@ -1782,8 +1803,13 @@ std::vector<ChainStageSpanNs> chain_wait(uint64_t ticket) {
   auto& d = metal::device(mlx::core::Device::gpu);
   auto* mtl_device = d.mtl_device();
 
-  // Correlation point #2 (completion side); slope over pre->post maps GPU ticks
-  // to CPU nanoseconds. mach_absolute_time ticks -> ns via the cached timebase.
+  // Correlation point #2 (completion side): two-point CPU/GPU correlation maps GPU
+  // counter ticks -> ns. sampleTimestamps' CPU value is ALREADY nanoseconds on
+  // Apple Silicon (Metal normalizes it) — the slope Δcpu_ns/Δgpu_ticks is the true
+  // ns-per-tick and the mach timebase must NOT be applied on top (doing so was the
+  // §37.10 units defect: every span came out 125/3 ≈ 41.67x too large). The mach
+  // timebase is a FALLBACK only, used when the two GPU samples do not separate
+  // (Δgpu_ticks == 0) — the Apple-Silicon GPU counter is in mach-absolute ticks.
   MTL::Timestamp cpu_post = 0, gpu_post = 0;
   mtl_device->sampleTimestamps(&cpu_post, &gpu_post);
   static const mach_timebase_info_data_t tb = [] {
@@ -1791,19 +1817,21 @@ std::vector<ChainStageSpanNs> chain_wait(uint64_t ticket) {
     mach_timebase_info(&t);
     return t;
   }();
-  if (static_cast<uint64_t>(gpu_post) <= entry.gpu_pre ||
-      static_cast<uint64_t>(cpu_post) <= entry.cpu_pre || tb.denom == 0) {
-    return spans;
-  }
+  const double fallback_ns_per_tick =
+      tb.denom ? static_cast<double>(tb.numer) / static_cast<double>(tb.denom)
+               : 0.0;
   const double cpu_delta_ns =
-      static_cast<double>(static_cast<uint64_t>(cpu_post) - entry.cpu_pre) *
-      static_cast<double>(tb.numer) / static_cast<double>(tb.denom);
-  const double gpu_delta =
-      static_cast<double>(static_cast<uint64_t>(gpu_post) - entry.gpu_pre);
-  if (gpu_delta <= 0.0 || cpu_delta_ns <= 0.0) {
+      static_cast<double>(static_cast<uint64_t>(cpu_post)) -
+      static_cast<double>(entry.cpu_pre); // already ns — no timebase applied
+  const double gpu_delta_ticks =
+      static_cast<double>(static_cast<uint64_t>(gpu_post)) -
+      static_cast<double>(entry.gpu_pre);
+  // Usability probe (tick_delta 0 -> 0 ns when a scale exists, <0 when neither a
+  // correlation nor a fallback scale is available): fail-open with no spans.
+  if (chain_ticks_to_ns(0, cpu_delta_ns, gpu_delta_ticks, fallback_ns_per_tick) <
+      0.0) {
     return spans;
   }
-  const double ns_per_tick = cpu_delta_ns / gpu_delta;
 
   const NS::UInteger n_slots =
       static_cast<NS::UInteger>(entry.encoder_tags.size() * 2);
@@ -1828,8 +1856,10 @@ std::vector<ChainStageSpanNs> chain_wait(uint64_t ticket) {
       s.duration_ns = 0;
     } else {
       s.valid = true;
-      s.duration_ns =
-          static_cast<uint64_t>(static_cast<double>(t1 - t0) * ns_per_tick + 0.5);
+      s.duration_ns = static_cast<uint64_t>(
+          chain_ticks_to_ns(
+              t1 - t0, cpu_delta_ns, gpu_delta_ticks, fallback_ns_per_tick) +
+          0.5);
     }
     spans.push_back(s);
   }

@@ -514,4 +514,23 @@ void init_metal(nb::module_& m) {
       blit encoder. The list is EMPTY when GPU counter sampling is unavailable at
       runtime (fail-open) — the timing is diagnostic and never affects the decode.
       )pbdoc");
+
+  metal.def(
+      "chain_ticks_to_ns",
+      [](uint64_t tick_delta, double cpu_delta_ns, double gpu_delta_ticks,
+         double fallback_ns_per_tick) {
+        return mx::metal::chain_ticks_to_ns(
+            tick_delta, cpu_delta_ns, gpu_delta_ticks, fallback_ns_per_tick);
+      },
+      "tick_delta"_a, "cpu_delta_ns"_a, "gpu_delta_ticks"_a,
+      "fallback_ns_per_tick"_a = 0.0,
+      R"pbdoc(
+      Pure GPU-tick -> nanosecond conversion used by :func:`chain_wait` (exposed for
+      testing the correlation math). Scale = ``cpu_delta_ns / gpu_delta_ticks`` (the
+      two-point CPU/GPU correlation from ``sampleTimestamps``, whose CPU value is
+      ALREADY ns on Apple Silicon — it must NOT be re-scaled by the mach timebase).
+      Falls back to ``fallback_ns_per_tick`` (the static mach timebase) only when the
+      correlation is degenerate (``gpu_delta_ticks == 0``). Returns a NEGATIVE value
+      when neither a correlation nor a fallback scale is available.
+      )pbdoc");
 }

@@ -325,6 +325,22 @@ struct ChainStageSpanNs {
   uint64_t duration_ns = 0;
 };
 
+/** Pure GPU-tick → nanosecond conversion used by chain_wait's resolution path
+ * (report §37.10), exposed for a CPU unit test of the correlation math. Scale =
+ * `cpu_delta_ns / gpu_delta_ticks` — the two-point CPU/GPU correlation from
+ * MTLDevice::sampleTimestamps, whose CPU value is ALREADY nanoseconds on Apple
+ * Silicon and must NOT be re-scaled by the mach timebase (that re-scaling was the
+ * units defect the W1 window's own coverage field caught). When the correlation is
+ * degenerate (`gpu_delta_ticks == 0`) it falls back to `fallback_ns_per_tick` (the
+ * static mach timebase, e.g. 125/3 on Apple Silicon). Returns a NEGATIVE value when
+ * neither a correlation nor a fallback scale is available — chain_wait then yields
+ * no spans (fail-open). No Metal state touched; safe to unit-test in isolation. */
+MLX_API double chain_ticks_to_ns(
+    uint64_t tick_delta,
+    double cpu_delta_ns,
+    double gpu_delta_ticks,
+    double fallback_ns_per_tick);
+
 /** Encode every stage's ICB (+ its feedback blits) and the cross-handle
  * `handoffs` into ONE command buffer in dependency order (fenced per boundary,
  * see above) and commit WITHOUT waiting; returns an opaque ticket. `stages` must

@@ -142,6 +142,23 @@ uint64_t chain_submit(
 std::vector<ChainStageSpanNs> chain_wait(uint64_t) {
   throw std::runtime_error("[chain_wait] No Metal back-end.");
 }
+// Pure arithmetic (no Metal state) — real impl even in the no-metal build so the
+// conversion seam is testable everywhere (report §37.10).
+double chain_ticks_to_ns(
+    uint64_t tick_delta,
+    double cpu_delta_ns,
+    double gpu_delta_ticks,
+    double fallback_ns_per_tick) {
+  double ns_per_tick;
+  if (gpu_delta_ticks > 0.0 && cpu_delta_ns > 0.0) {
+    ns_per_tick = cpu_delta_ns / gpu_delta_ticks;
+  } else if (gpu_delta_ticks == 0.0 && fallback_ns_per_tick > 0.0) {
+    ns_per_tick = fallback_ns_per_tick;
+  } else {
+    return -1.0;
+  }
+  return static_cast<double>(tick_delta) * ns_per_tick;
+}
 
 } // namespace metal
 
