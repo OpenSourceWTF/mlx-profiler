@@ -5,6 +5,11 @@ This repository is a public fork of
 instrumentation. Its dispatch census is a discovery tool: it is disabled by
 default and must remain disarmed in serving and gated benchmark runs.
 
+The preserved capture-replay, device-feedback, chained-cycle, GPU-timing, and
+within-stage split experiments are intentionally kept off `main`. Their exact
+branches, commits, opt-in gates, and base-version caveats are indexed in
+[`EXPERIMENTS.md`](EXPERIMENTS.md).
+
 The profiler records how MLX encodes work, groups dispatches into Metal command
 buffers, overlaps host encoding with GPU execution, and waits on allocator,
 scheduler, and synchronization boundaries. It does not add GPU synchronization
