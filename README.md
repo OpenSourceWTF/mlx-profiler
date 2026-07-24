@@ -1,5 +1,12 @@
 # MLX
 
+> **OpenSourceWTF profiler fork.** The default branch tracks official MLX plus
+> the hardened, opt-in dispatch census documented in
+> [PROFILER.md](PROFILER.md). The complete historical capture-replay,
+> device-feedback, chain-replay, GPU-timing, and stage-splitting work is public
+> on preserved experiment branches documented in
+> [EXPERIMENTS.md](EXPERIMENTS.md). None of these diagnostics arm by default.
+
 [**Quickstart**](#quickstart) | [**Installation**](#installation) |
 [**Documentation**](https://ml-explore.github.io/mlx/build/html/index.html) |
 [**Examples**](#examples)
