@@ -1,14 +1,38 @@
+# OpenSourceWTF MLX Metal profiler
+
+This public fork adds an opt-in Metal dispatch census to current MLX and
+preserves the complete historical capture-replay, device-feedback,
+chain-replay, GPU-timing, and stage-splitting experiments. All diagnostics
+default to off.
+
+> [!IMPORTANT]
+> This profiler must be built from this repository. `pip install mlx` installs
+> the official MLX package **without** OpenSourceWTF profiler instrumentation.
+> Before capturing a trace, follow the import-path check in the profiler
+> quickstart.
+
+[**Capture a trace**](PROFILER.md#first-census-quickstart) |
+[**Open the hosted workbench**](https://mlx-profiler.opensource.wtf) |
+[**Run locally**](https://github.com/OpenSourceWTF/metal-dispatch-viz#quick-local-start) |
+[**Explore preserved experiments**](EXPERIMENTS.md) |
+[**Contribute**](CONTRIBUTING.md#contributing-to-the-opensourcewtf-profiler-fork)
+
+The dispatch census is a discovery instrument, not a serving feature. Keep it
+disabled in production serving and gated benchmark runs. The preserved
+capture-replay line is historical diagnostic work based on MLX `v0.31.2`; read
+its branch and safety boundaries before use.
+
+---
+
 # MLX
 
-> **OpenSourceWTF profiler fork.** The default branch tracks official MLX plus
-> the hardened, opt-in dispatch census documented in
-> [PROFILER.md](PROFILER.md). The complete historical capture-replay,
-> device-feedback, chain-replay, GPU-timing, and stage-splitting work is public
-> on preserved experiment branches documented in
-> [EXPERIMENTS.md](EXPERIMENTS.md). None of these diagnostics arm by default.
+The remainder of this README describes upstream MLX. For the OpenSourceWTF
+profiler, use [PROFILER.md](PROFILER.md), not the upstream package installation
+below.
 
-[**Quickstart**](#quickstart) | [**Installation**](#installation) |
-[**Documentation**](https://ml-explore.github.io/mlx/build/html/index.html) |
+[**Upstream quickstart**](#upstream-mlx-quickstart) |
+[**Install official MLX**](#install-official-mlx) |
+[**Upstream documentation**](https://ml-explore.github.io/mlx/build/html/index.html) |
 [**Examples**](#examples)
 
 [![CircleCI](https://circleci.com/gh/ml-explore/mlx.svg?style=svg)](https://circleci.com/gh/ml-explore/mlx)
@@ -67,13 +91,16 @@ variety of examples, including:
 - Generating images with [Stable Diffusion](https://github.com/ml-explore/mlx-examples/tree/main/stable_diffusion).
 - Speech recognition with [OpenAI's Whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper).
 
-## Quickstart
+## Upstream MLX quickstart
 
 See the [quick start
 guide](https://ml-explore.github.io/mlx/build/html/usage/quick_start.html)
 in the documentation.
 
-## Installation
+## Install official MLX
+
+The following commands install official MLX. They do not install this fork's
+profiler instrumentation.
 
 MLX is available on [PyPI](https://pypi.org/project/mlx/). To install MLX on
 macOS, run:
